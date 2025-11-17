@@ -12,22 +12,22 @@
 bool g_bGamePaused = false;
 Handle g_hPauseTimer = null;
 
-int g_iTeamPausesLeft[4]; // 0=unassigned, 2=T, 3=CT
+int g_iTeamPausesLeft[4]; // 0=未分配, 2=T, 3=CT
 
-// Store native function calls
+// 存储原生函数调用
 Handle g_hForward_OnBotPause = null;
 
 public Plugin myinfo = {
     name = "CSGO Simple Pause System",
     author = "Tasty cup",
-    description = "Simple pause system, 4 pauses per team",
+    description = "简单的暂停系统，每队4次暂停机会",
     version = PLUGIN_VERSION,
     url = ""
 };
 
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max)
 {
-    // Create native functions for other plugins to call
+    // 创建原生函数供其他插件调用
     CreateNative("BotPause_ExecutePause", Native_ExecutePause);
     CreateNative("BotPause_GetTeamPausesLeft", Native_GetTeamPausesLeft);
     
@@ -36,11 +36,11 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max
 }
 
 public void OnPluginStart() {
-    // Load translation file
+    // 加载翻译文件
     LoadTranslations("bot_pause.phrases");
     
-    RegConsoleCmd("sm_p", Command_Pause, "Pause the game");
-    RegConsoleCmd("sm_pause", Command_Pause, "Pause the game");
+    RegConsoleCmd("sm_p", Command_Pause, "暂停游戏");
+    RegConsoleCmd("sm_pause", Command_Pause, "暂停游戏");
     
     AddCommandListener(ChatListener, "say");
     AddCommandListener(ChatListener, "say_team");
@@ -48,16 +48,16 @@ public void OnPluginStart() {
     HookEvent("round_start", Event_RoundStart); 
     HookEvent("round_end", Event_RoundEnd);
     
-    // Initialize pause counts
-    g_iTeamPausesLeft[2] = MAX_TEAM_PAUSES; // T team
-    g_iTeamPausesLeft[3] = MAX_TEAM_PAUSES; // CT team
+    // 初始化暂停次数
+    g_iTeamPausesLeft[2] = MAX_TEAM_PAUSES; // T队
+    g_iTeamPausesLeft[3] = MAX_TEAM_PAUSES; // CT队
     
-    // Create Forward
+    // 创建Forward
     g_hForward_OnBotPause = CreateGlobalForward("BotPause_OnPauseExecuted", ET_Ignore, Param_Cell, Param_Cell);
 }
 
 public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast) {
-    // Reset pause counts when current round is 0
+    // 当前回合为0时重置暂停次数
     int iCurrentRound = GameRules_GetProp("m_totalRoundsPlayed");
     if (iCurrentRound == 0) {
         g_iTeamPausesLeft[2] = MAX_TEAM_PAUSES;
@@ -156,13 +156,13 @@ void ExecutePause(int client, int team, int pauseTime) {
     char coloredCount[32];
     Format(coloredCount, sizeof(coloredCount), "\x04%d\x01", g_iTeamPausesLeft[team]);
     
-    // Use LANG_SERVER to broadcast to all players, each player will see the version in their own language
+    // 使用 LANG_SERVER 来广播给所有玩家，每个玩家会看到自己语言的版本
     for (int i = 1; i <= MaxClients; i++) {
         if (!IsClientInGame(i)) {
             continue;
         }
         
-        // If it's the default pause time, don't show the time
+        // 如果是默认暂停时间，不显示时间
         if (pauseTime == DEFAULT_PAUSE_TIME) {
             Format(message, sizeof(message), "%T", "Pause_No_Time", i, clientName, teamName, coloredCount);
             PrintToChat(i, " [\x04CSGO\x01] %s", message);
@@ -176,7 +176,7 @@ void ExecutePause(int client, int team, int pauseTime) {
     
     g_hPauseTimer = CreateTimer(float(pauseTime), Timer_AutoUnpause);
     
-    // Trigger Forward to notify other plugins
+    // 触发Forward通知其他插件
     Call_StartForward(g_hForward_OnBotPause);
     Call_PushCell(client);
     Call_PushCell(pauseTime);
@@ -206,11 +206,11 @@ public void OnPluginEnd() {
 }
 
 /**
- * Execute pause
+ * 执行暂停
  * 
- * @param plugin        Calling plugin handle
- * @param numParams     Number of parameters
- * @return              1=success, 0=failure
+ * @param plugin        调用插件句柄
+ * @param numParams     参数数量
+ * @return              1=成功, 0=失败
  */
 public int Native_ExecutePause(Handle plugin, int numParams) {
     int client = GetNativeCell(1);
@@ -246,11 +246,11 @@ public int Native_ExecutePause(Handle plugin, int numParams) {
 }
 
 /**
- * Get team's remaining pauses
+ * 获取队伍剩余暂停次数
  * 
- * @param plugin        Calling plugin handle
- * @param numParams     Number of parameters
- * @return              Remaining count
+ * @param plugin        调用插件句柄
+ * @param numParams     参数数量
+ * @return              剩余次数
  */
 public int Native_GetTeamPausesLeft(Handle plugin, int numParams) {
     int team = GetNativeCell(1);
@@ -262,9 +262,9 @@ public int Native_GetTeamPausesLeft(Handle plugin, int numParams) {
     return g_iTeamPausesLeft[team];
 }
 
-//Cancel pause
+//取消暂停
 public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast) {
-    // Immediately cancel pause when round ends
+    // 回合结束时立即取消暂停
     if (g_hPauseTimer != null) {
         KillTimer(g_hPauseTimer);
         g_hPauseTimer = null;
@@ -278,7 +278,7 @@ public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast) {
 }
 
 // ============================================================================
-// Helper functions
+// 辅助函数
 // ============================================================================
 
 bool IsValidClient(int client) {
