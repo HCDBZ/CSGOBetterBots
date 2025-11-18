@@ -147,6 +147,12 @@ StringMap g_hWeaponTypes;
 // 暂停系统(用于全局模式)
 bool g_bPausePluginLoaded = false;                // 使用bot_pause插件
 
+// 聊天系统
+JSONArray g_jChatData = null;                     // 聊天数据
+ArrayList g_hChatActions[MAXPLAYERS+1];           // 每个bot的聊天队列
+int g_iChatActionIndex[MAXPLAYERS+1];             // 当前聊天动作索引
+Handle g_hChatTimer[MAXPLAYERS+1];                // 每个bot的聊天timer
+
 // 购买数据（用于经济模式）
 JSONObject g_jPurchaseData = null;
 // C4持有者数据
@@ -238,7 +244,12 @@ public void OnPluginStart()
         g_bAllowPurchase[i] = false;
         g_hDropTimer[i] = null;
         g_hDropActions[i] = null;
-        g_iDropActionIndex[i] = 0;        
+        g_iDropActionIndex[i] = 0;  
+
+        // 初始化聊天数据 
+        g_hChatTimer[i] = null;
+        g_hChatActions[i] = null;
+        g_iChatActionIndex[i] = 0;             
     }
     
     // 重置阵营回合选择
@@ -322,6 +333,13 @@ public void OnMapEnd()
         KillTimer(g_hBombCarrierCheckTimer);
         g_hBombCarrierCheckTimer = null;
     }
+    
+    // 清理聊天数据
+    if (g_jChatData != null)
+    {
+        delete g_jChatData;
+        g_jChatData = null;
+    }
 }
 
 public void OnClientPostAdminCheck(int client)
@@ -375,6 +393,19 @@ public void OnClientDisconnect(int client)
         delete g_hDropActions[client];
         g_hDropActions[client] = null;
     }
+    
+    // 清理聊天数据
+    if (g_hChatTimer[client] != null)
+    {
+        KillTimer(g_hChatTimer[client]);
+        g_hChatTimer[client] = null;
+    }
+    
+    if (g_hChatActions[client] != null)
+    {
+        delete g_hChatActions[client];
+        g_hChatActions[client] = null;
+    }
 }
 
 
@@ -412,6 +443,7 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
             PrintToServer("[Bot REC] Selected folder: %s", g_szCurrentRecFolder);
             LoadFreezeTimes(szMap, g_szCurrentRecFolder);
             LoadPurchaseDataFile(g_szCurrentRecFolder);
+            LoadChatDataFile(g_szCurrentRecFolder);
         }
         else
         {
@@ -731,6 +763,21 @@ public void BotMimic_OnPlayerStopsMimicing(int client, char[] name, char[] categ
         }
         g_iDropActionIndex[client] = 0;
         
+        // 安全地停止聊天timer
+        if (g_hChatTimer[client] != null)
+        {
+            KillTimer(g_hChatTimer[client]);
+            g_hChatTimer[client] = null;
+        }
+        
+        // 清理聊天动作
+        if (g_hChatActions[client] != null)
+        {
+            delete g_hChatActions[client];
+            g_hChatActions[client] = null;
+        }
+        g_iChatActionIndex[client] = 0;
+        
         // Unhook伤害
         SDKUnhook(client, SDKHook_OnTakeDamage, OnTakeDamage);
     }
@@ -838,6 +885,29 @@ void AssignAndPlayRec(int client)
                 TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
             
             PrintToServer("[Bot REC] Bot %d purchase timer started", client);
+        }
+
+        // 加载聊天数据
+        bool bChatLoaded = LoadChatActionsForBot(client, iRoundToUse);
+        PrintToServer("[Bot REC] Bot %d chat data loaded: %s", 
+            client, bChatLoaded ? "YES" : "NO");
+        
+        if (bChatLoaded)
+        {
+            // 清理旧的聊天timer
+            if (g_hChatTimer[client] != null)
+            {
+                KillTimer(g_hChatTimer[client]);
+                g_hChatTimer[client] = null;
+            }
+            
+            // 创建聊天执行timer
+            DataPack pack = new DataPack();
+            pack.WriteCell(GetClientUserId(client));
+            g_hChatTimer[client] = CreateTimer(0.1, Timer_ExecuteChatAction, pack, 
+                TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+            
+            PrintToServer("[Bot REC] Bot %d chat timer started", client);
         }
         
         // 开始播放REC
@@ -2231,6 +2301,118 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
     return (iValidRoundsForPause > 0 || iValidRoundsForEconomy > 0);
 }
 
+// 聊天
+bool LoadChatDataFile(const char[] szRecFolder)
+{
+    char szMap[64];
+    GetCurrentMap(szMap, sizeof(szMap));
+    GetMapDisplayName(szMap, szMap, sizeof(szMap));
+    
+    char szPath[PLATFORM_MAX_PATH];
+    BuildPath(Path_SM, szPath, sizeof(szPath), 
+        "data/botmimic/all/%s/%s/chat.json", szMap, szRecFolder);
+    
+    if (!FileExists(szPath))
+    {
+        PrintToServer("[Bot Chat] Chat data file not found: %s", szPath);
+        return false;
+    }
+    
+    // 清理旧数据
+    if (g_jChatData != null)
+        delete g_jChatData;
+    
+    // 加载JSON
+    g_jChatData = view_as<JSONArray>(JSONArray.FromFile(szPath));
+    if (g_jChatData == null)
+    {
+        PrintToServer("[Bot Chat] Failed to parse chat data JSON");
+        return false;
+    }
+    
+    PrintToServer("[Bot Chat] Loaded chat data from: %s (messages: %d)", 
+        szPath, g_jChatData.Length);
+    return true;
+}
+
+bool LoadChatActionsForBot(int client, int iRound)
+{
+    if (g_jChatData == null)
+    {
+        PrintToServer("[Bot Chat] No chat data loaded");
+        return false;
+    }
+    
+    // 获取bot的REC名称
+    if (g_szCurrentRecName[client][0] == '\0')
+    {
+        PrintToServer("[Bot Chat] Client %d has no rec name assigned", client);
+        return false;
+    }
+    
+    char szBotRecName[PLATFORM_MAX_PATH];
+    strcopy(szBotRecName, sizeof(szBotRecName), g_szCurrentRecName[client]);
+    
+    // 清理旧数据
+    if (g_hChatActions[client] != null)
+        delete g_hChatActions[client];
+    
+    g_hChatActions[client] = new ArrayList(ByteCountToCells(256));
+    g_iChatActionIndex[client] = 0;
+    
+    int iChatCount = 0;
+    int iTargetRound = iRound + 1;  // round1 = iRound 0
+    
+    // 遍历所有聊天消息
+    for (int i = 0; i < g_jChatData.Length; i++)
+    {
+        JSONObject jMessage = view_as<JSONObject>(g_jChatData.Get(i));
+        
+        int iMsgRound = jMessage.GetInt("round");
+        
+        // 只加载当前回合的消息
+        if (iMsgRound != iTargetRound)
+        {
+            delete jMessage;
+            continue;
+        }
+        
+        char szPlayerName[MAX_NAME_LENGTH];
+        jMessage.GetString("player_name", szPlayerName, sizeof(szPlayerName));
+        
+        // 检查是否是这个bot的消息
+        if (!StrEqual(szPlayerName, szBotRecName, false))
+        {
+            delete jMessage;
+            continue;
+        }
+        
+        // 读取消息数据
+        float fTime = jMessage.GetFloat("time");
+        char szMessage[256];
+        jMessage.GetString("message", szMessage, sizeof(szMessage));
+        bool bIsTeamChat = jMessage.GetBool("is_team_chat");
+        
+        // 构建聊天动作字符串: "时间|消息|是否队伍聊天"
+        char szChatAction[256];
+        Format(szChatAction, sizeof(szChatAction), "%.3f|%s|%d", 
+            fTime, szMessage, bIsTeamChat ? 1 : 0);
+        
+        g_hChatActions[client].PushString(szChatAction);
+        iChatCount++;
+        
+        PrintToServer("[Bot Chat]   Chat %d: %.2fs - %s (team=%d)", 
+            iChatCount, fTime, szMessage, bIsTeamChat ? 1 : 0);
+        
+        delete jMessage;
+    }
+    
+    PrintToServer("[Bot Chat] Loaded %d chat messages for client %d (rec: %s)", 
+        iChatCount, client, szBotRecName);
+    
+    return (iChatCount > 0);
+}
+
 // ============================================================================
 // 购买系统
 // ============================================================================
@@ -2415,6 +2597,7 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
                 Format(szActionStr, sizeof(szActionStr), "%.1f|%s|%s", fTime, szItem, szSlot);
                 g_hPurchaseActions[client].PushString(szActionStr);
                 
+                PrintToServer("[Bot Purchase]   Action %d: BUY %s at %.2fs", i, szItem, fTime);
                 iPurchaseCount++;
             }
             // 处理丢弃动作
@@ -2444,6 +2627,8 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     {
         JSONArray jInventory = view_as<JSONArray>(jBotData.Get("final_inventory"));
         
+        PrintToServer("[Bot Purchase] Loading final inventory for client %d:", client);
+        
         for (int i = 0; i < jInventory.Length; i++)
         {
             char szItem[64];
@@ -2461,7 +2646,7 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     delete jTeam;
     delete jRound;
     
-    // 设置装备验证定时器
+    // 设置装备验证定时器 - 在冻结时间50%时触发
     ConVar cvFreezeTime = FindConVar("mp_freezetime");
     if (cvFreezeTime != null)
     {
@@ -2469,26 +2654,24 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
         
         if (fFreezeTime > 3.0 && g_hFinalInventory[client].Length > 0)
         {
-            float fVerifyDelay = fFreezeTime - GetRandomFloat(2.5, 3.0);
+            // 在冻结时间的50%时开始验证
+            float fVerifyDelay = fFreezeTime * 0.5;
             DataPack pack = new DataPack();
             pack.WriteCell(GetClientUserId(client));
             g_hVerifyTimer[client] = CreateTimer(fVerifyDelay, Timer_VerifyInventory, pack);
+            
+            PrintToServer("[Bot Purchase] Verify timer set for client %d: delay=%.2fs", 
+                client, fVerifyDelay);
         }
         else
         {
-            PrintToServer("[Bot Purchase] ✗ NOT setting verify timer: freezetime=%.1f, inventory_count=%d", 
+            PrintToServer("[Bot Purchase] NOT setting verify timer: freezetime=%.1f, inventory_count=%d", 
                 fFreezeTime, g_hFinalInventory[client] != null ? g_hFinalInventory[client].Length : 0);
         }
     }
     else
     {
-        PrintToServer("[Bot Purchase] ✗ ERROR: mp_freezetime cvar not found!");
-    }
-    
-    // 如果使用的是临时加载的数据，需要删除
-    if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
-    {
-        delete jUsePurchaseData;
+        PrintToServer("[Bot Purchase] ERROR: mp_freezetime cvar not found!");
     }
     
     // 如果有丢弃动作且功能已启用，启动丢弃timer
@@ -2501,6 +2684,15 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     
         PrintToServer("[Bot Drop] Bot %d drop timer started with %d actions", client, iDropCount);
     }
+    
+    // 如果使用的是临时加载的数据，需要删除
+    if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+    {
+        delete jUsePurchaseData;
+    }
+    
+    PrintToServer("[Bot Purchase] Summary for client %d: purchases=%d, drops=%d, final_inventory=%d", 
+        client, iPurchaseCount, iDropCount, iInventoryCount);
     
     return (iPurchaseCount > 0 || iDropCount > 0 || iInventoryCount > 0);
 }
@@ -2694,6 +2886,90 @@ public Action Timer_ExecuteDropAction(Handle hTimer, DataPack pack)
     if (g_iDropActionIndex[client] >= g_hDropActions[client].Length)
     {
         g_hDropTimer[client] = null;  
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    return Plugin_Continue;
+}
+
+//聊天计时器
+public Action Timer_ExecuteChatAction(Handle hTimer, DataPack pack)
+{
+    pack.Reset();
+    int iUserId = pack.ReadCell();
+    
+    int client = GetClientOfUserId(iUserId);
+    if (!IsValidClient(client))
+    {
+        g_hChatTimer[client] = null;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    if (!g_bPlayingRoundStartRec[client])
+    {
+        g_hChatTimer[client] = null;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    if (g_hChatActions[client] == null)
+    {
+        g_hChatTimer[client] = null;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    if (!IsPlayerAlive(client))
+        return Plugin_Continue;
+    
+    float fCurrentTime = GetGameTime() - g_fRecStartTime[client];
+    
+    while (g_iChatActionIndex[client] < g_hChatActions[client].Length)
+    {
+        char szAction[256];
+        g_hChatActions[client].GetString(g_iChatActionIndex[client], szAction, sizeof(szAction));
+        
+        char szParts[3][256];
+        int iParts = ExplodeString(szAction, "|", szParts, sizeof(szParts), sizeof(szParts[]));
+        
+        if (iParts < 3)
+        {
+            g_iChatActionIndex[client]++;
+            continue;
+        }
+        
+        float fActionTime = StringToFloat(szParts[0]);
+        
+        if (fCurrentTime < fActionTime)
+            break;
+        
+        char szMessage[256];
+        strcopy(szMessage, sizeof(szMessage), szParts[1]);
+        bool bIsTeamChat = (StringToInt(szParts[2]) == 1);
+        
+        // 执行聊天
+        if (bIsTeamChat)
+        {
+            FakeClientCommand(client, "say_team %s", szMessage);
+        }
+        else
+        {
+            FakeClientCommand(client, "say %s", szMessage);
+        }
+        
+        char szBotName[MAX_NAME_LENGTH];
+        GetClientName(client, szBotName, sizeof(szBotName));
+        PrintToServer("[Bot Chat] %s said: %s (team=%d)", 
+            szBotName, szMessage, bIsTeamChat ? 1 : 0);
+        
+        g_iChatActionIndex[client]++;
+    }
+    
+    if (g_iChatActionIndex[client] >= g_hChatActions[client].Length)
+    {
+        g_hChatTimer[client] = null;
         delete pack;
         return Plugin_Stop;
     }
