@@ -5498,6 +5498,46 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
     PrintToServer("[C4 Holder] ===== FREEZE START C4 ASSIGNMENT =====");
     PrintToServer("[C4 Holder] Target holder: %s (Round %d)", szHolderName, g_iCurrentRound + 1);
     
+    // 首先检查C4是否在真人玩家手上
+    int iCurrentHolder = -1;
+    bool bIsOnRealPlayer = false;
+    
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (!IsValidClient(i) || !IsPlayerAlive(i))
+            continue;
+        
+        if (GetClientTeam(i) != CS_TEAM_T)
+            continue;
+        
+        int iC4 = GetPlayerWeaponSlot(i, CS_SLOT_C4);
+        if (IsValidEntity(iC4))
+        {
+            char szClass[64];
+            GetEntityClassname(iC4, szClass, sizeof(szClass));
+            
+            if (StrEqual(szClass, "weapon_c4", false))
+            {
+                iCurrentHolder = i;
+                bIsOnRealPlayer = !IsFakeClient(i);
+                
+                char szCurrentName[MAX_NAME_LENGTH];
+                GetClientName(i, szCurrentName, sizeof(szCurrentName));
+                PrintToServer("[C4 Holder] Current holder: %s (client %d, bot=%d)", 
+                    szCurrentName, i, IsFakeClient(i) ? 1 : 0);
+                break;
+            }
+        }
+    }
+    
+    // 如果C4在玩家手上，不进行转移
+    if (bIsOnRealPlayer)
+    {
+        char szPlayerName[MAX_NAME_LENGTH];
+        GetClientName(iCurrentHolder, szPlayerName, sizeof(szPlayerName));
+        return Plugin_Stop;
+    }
+    
     // 查找目标bot
     int iTargetBot = -1;
     
@@ -5530,7 +5570,14 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
     GetClientName(iTargetBot, szTargetName, sizeof(szTargetName));
     PrintToServer("[C4 Holder] Found target: %s (client %d)", szTargetName, iTargetBot);
     
-    // 移除所有其他T方bot的C4
+    // 检查目标bot是否已有C4
+    int iTargetC4 = GetPlayerWeaponSlot(iTargetBot, CS_SLOT_C4);
+    if (IsValidEntity(iTargetC4))
+    {
+        return Plugin_Stop;
+    }
+    
+    // 移除所有其他T方bot的C4（不包括真人玩家）
     int iRemovedCount = 0;
     for (int i = 1; i <= MaxClients; i++)
     {
@@ -5538,6 +5585,10 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
             continue;
         
         if (GetClientTeam(i) != CS_TEAM_T)
+            continue;
+        
+        // 跳过真人玩家
+        if (!IsFakeClient(i))
             continue;
         
         int iC4 = GetPlayerWeaponSlot(i, CS_SLOT_C4);
@@ -5557,15 +5608,6 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
                 iRemovedCount++;
             }
         }
-    }
-    
-    // 检查目标bot是否已有C4
-    int iTargetC4 = GetPlayerWeaponSlot(iTargetBot, CS_SLOT_C4);
-    if (IsValidEntity(iTargetC4))
-    {
-        PrintToServer("[C4 Holder] ✓ Target %s already has C4", szTargetName);
-        PrintToServer("[C4 Holder] ===== ASSIGNMENT COMPLETE =====");
-        return Plugin_Stop;
     }
     
     // 给目标bot分配C4
