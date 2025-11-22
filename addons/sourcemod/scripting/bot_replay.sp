@@ -17,7 +17,7 @@ public Plugin myinfo =
 	name = "Bot Round Start REC Player", 
 	author = "Tasty cup", 
 	description = "Play recordings for bots at round start", 
-	version = "1.0.0", 
+	version = "1.0.1", 
 	url = ""
 };
 
@@ -35,8 +35,7 @@ public Plugin myinfo =
 enum BotState
 {
     BotState_Normal = 0,     // 正常状态
-    BotState_PlayingREC,     // 正在播放REC
-    BotState_Busy            // 忙碌状态
+    BotState_PlayingREC      // 正在播放REC
 }
 
 // 回合选择模式 (默认)
@@ -359,61 +358,8 @@ public void OnClientPostAdminCheck(int client)
 public void OnClientDisconnect(int client)
 {
     ResetClientData(client);
-    
-    // 清理购买相关数据
-    if (g_hPurchaseTimer[client] != null)
-    {
-        KillTimer(g_hPurchaseTimer[client]);
-        g_hPurchaseTimer[client] = null;
-    }
-    
-    if (g_hPurchaseActions[client] != null)
-    {
-        delete g_hPurchaseActions[client];
-        g_hPurchaseActions[client] = null;
-    }
-    
-    if (g_hVerifyTimer[client] != null)
-    {
-        KillTimer(g_hVerifyTimer[client]);
-        g_hVerifyTimer[client] = null;
-    }
-    
-    if (g_hFinalInventory[client] != null)
-    {
-        delete g_hFinalInventory[client];
-        g_hFinalInventory[client] = null;
-    }
-    
-    g_bAllowPurchase[client] = false;
-    
-    // 清理丢弃数据
-    if (g_hDropTimer[client] != null)
-    {
-        KillTimer(g_hDropTimer[client]);
-        g_hDropTimer[client] = null;
-    }
-    
-    if (g_hDropActions[client] != null)
-    {
-        delete g_hDropActions[client];
-        g_hDropActions[client] = null;
-    }
-    
-    // 清理聊天数据
-    if (g_hChatTimer[client] != null)
-    {
-        KillTimer(g_hChatTimer[client]);
-        g_hChatTimer[client] = null;
-    }
-    
-    if (g_hChatActions[client] != null)
-    {
-        delete g_hChatActions[client];
-        g_hChatActions[client] = null;
-    }
+    CleanupClientTimers(client);
 }
-
 
 // ============================================================================
 // 游戏事件处理
@@ -496,25 +442,15 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
         
         if (g_bRecFolderSelected && g_szCurrentRecFolder[0] != '\0')
         {
-            float fDemoFreezeTimes[31];
-            bool bDemoFreezeValid[31];
-            if (LoadFreezeTimesForDemo(szMap, g_szCurrentRecFolder, fDemoFreezeTimes, bDemoFreezeValid))
+            if (g_bAllRoundFreezeTimeValid[g_iCurrentRound])
             {
-                if (bDemoFreezeValid[g_iCurrentRound])
-                {
-                    float fDemoFreeze = fDemoFreezeTimes[g_iCurrentRound];
-                    float fVerifyDelay = fDemoFreeze - 3.0;
-                    if (fVerifyDelay < 0.1)
-                        fVerifyDelay = 0.1;
-                    
-                    g_fTeamVerifyDelay[CS_TEAM_T] = fVerifyDelay;
-                    g_fTeamVerifyDelay[CS_TEAM_CT] = fVerifyDelay;
-                }
-                else
-                {
-                    g_fTeamVerifyDelay[CS_TEAM_T] = 7.0;
-                    g_fTeamVerifyDelay[CS_TEAM_CT] = 7.0;
-                }
+                float fDemoFreeze = g_fAllRoundFreezeTimes[g_iCurrentRound];
+                float fVerifyDelay = fDemoFreeze - 3.0;
+                if (fVerifyDelay < 0.1)
+                    fVerifyDelay = 0.1;
+                
+                g_fTeamVerifyDelay[CS_TEAM_T] = fVerifyDelay;
+                g_fTeamVerifyDelay[CS_TEAM_CT] = fVerifyDelay;
             }
             else
             {
@@ -522,7 +458,7 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
                 g_fTeamVerifyDelay[CS_TEAM_CT] = 7.0;
             }
         }
-    }    
+    } 
     
     // 全局模式下的动态暂停系统
     if (g_iRoundMode == Round_FullMatch && g_bRecFolderSelected)
@@ -593,12 +529,12 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
         // 根据模式决定是否停止 REC
         if (g_iRoundMode == Round_Economy && g_iEconomyMode == Economy_SingleTeam)
         {
-            StopCTBotsRec_EconomyMode();
+            StopTeamBotsRec(CS_TEAM_CT, false);
         }
         else if (g_iRoundMode == Round_FullMatch || 
                 (g_iRoundMode == Round_Economy && g_iEconomyMode == Economy_BothTeams))
         {
-            StopBotsRec_FullMatchMode();
+            StopTeamBotsRec(CS_TEAM_CT, true);
         }
     }
     
@@ -708,57 +644,8 @@ public void BotMimic_OnPlayerStopsMimicing(int client, char[] name, char[] categ
 
         g_bPlayingRoundStartRec[client] = false;
         
-        // 安全地停止购买timer
-        if (g_hPurchaseTimer[client] != null)
-        {
-            KillTimer(g_hPurchaseTimer[client]);
-            g_hPurchaseTimer[client] = null;  
-        }
-        
-        // 清理购买动作数据
-        if (g_hPurchaseActions[client] != null)
-        {
-            delete g_hPurchaseActions[client];
-            g_hPurchaseActions[client] = null;
-        }
-        g_iPurchaseActionIndex[client] = 0;
-        
-        // 安全地停止验证timer
-        if (g_hVerifyTimer[client] != null)
-        {
-            KillTimer(g_hVerifyTimer[client]);
-            g_hVerifyTimer[client] = null; 
-        }
-
-        // 安全地停止丢弃timer
-        if (g_hDropTimer[client] != null)
-        {
-            KillTimer(g_hDropTimer[client]);
-            g_hDropTimer[client] = null;  
-        }
-        
-        // 清理丢弃动作
-        if (g_hDropActions[client] != null)
-        {
-            delete g_hDropActions[client];
-            g_hDropActions[client] = null;
-        }
-        g_iDropActionIndex[client] = 0;
-        
-        // 安全地停止聊天timer
-        if (g_hChatTimer[client] != null)
-        {
-            KillTimer(g_hChatTimer[client]);
-            g_hChatTimer[client] = null;
-        }
-        
-        // 清理聊天动作
-        if (g_hChatActions[client] != null)
-        {
-            delete g_hChatActions[client];
-            g_hChatActions[client] = null;
-        }
-        g_iChatActionIndex[client] = 0;
+        // 使用公共函数清理所有timer
+        CleanupClientTimers(client);
         
         // Unhook伤害
         SDKUnhook(client, SDKHook_OnTakeDamage, OnTakeDamage);
@@ -949,16 +836,9 @@ bool GetRoundStartRec(int client, int iRound, char[] szPath, int iMaxLen)
     
     // 使用bot专属的demo文件夹
     char szUseDemoFolder[PLATFORM_MAX_PATH];
+    GetUseDemoFolder(client, szUseDemoFolder, sizeof(szUseDemoFolder));
     
-    if (g_szBotRecFolder[client][0] != '\0')
-    {
-        strcopy(szUseDemoFolder, sizeof(szUseDemoFolder), g_szBotRecFolder[client]);
-    }
-    else if (g_bRecFolderSelected && g_szCurrentRecFolder[0] != '\0')
-    {
-        strcopy(szUseDemoFolder, sizeof(szUseDemoFolder), g_szCurrentRecFolder);
-    }
-    else
+    if (szUseDemoFolder[0] == '\0')
     {
         return false;
     }
@@ -1102,16 +982,9 @@ bool GetRoundStartMoney(int client, int iRound)
     
     // 使用demo专属的money配置
     char szUseDemoFolder[PLATFORM_MAX_PATH];
+    GetUseDemoFolder(client, szUseDemoFolder, sizeof(szUseDemoFolder));
     
-    if (g_szBotRecFolder[client][0] != '\0')
-    {
-        strcopy(szUseDemoFolder, sizeof(szUseDemoFolder), g_szBotRecFolder[client]);
-    }
-    else if (g_bRecFolderSelected && g_szCurrentRecFolder[0] != '\0')
-    {
-        strcopy(szUseDemoFolder, sizeof(szUseDemoFolder), g_szCurrentRecFolder);
-    }
-    else
+    if (szUseDemoFolder[0] == '\0')
     {
         g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
         return true;
@@ -1445,6 +1318,12 @@ void SelectRoundByEconomy(int iTeam)
             // 直接保存到bot专属变量
             strcopy(g_szAssignedRecName[client], PLATFORM_MAX_PATH, recInfo.recName);
             strcopy(g_szBotRecFolder[client], PLATFORM_MAX_PATH, szBestDemo);
+        }
+        else
+        {
+            // 清空未分配bot的数据，防止使用旧值
+            g_szAssignedRecName[client][0] = '\0';
+            g_szBotRecFolder[client][0] = '\0';
         }
     }
     
@@ -1831,6 +1710,12 @@ int SelectRoundByBothTeamsEconomy()
                 strcopy(g_szAssignedRecName[client], PLATFORM_MAX_PATH, recInfo.recName);
                 strcopy(g_szBotRecFolder[client], PLATFORM_MAX_PATH, szBestDemo);
             }
+            else
+            {
+                // 清空未分配bot的数据，防止使用旧值
+                g_szAssignedRecName[client][0] = '\0';
+                g_szBotRecFolder[client][0] = '\0';
+            }
         }
         
         // 虚拟发枪模拟
@@ -1863,9 +1748,12 @@ int SelectRoundByBothTeamsEconomy()
                 // 直接保存到bot专属变量
                 strcopy(g_szAssignedRecName[client], PLATFORM_MAX_PATH, recInfo.recName);
                 strcopy(g_szBotRecFolder[client], PLATFORM_MAX_PATH, szBestDemo);
-                
-                char szBotName[MAX_NAME_LENGTH];
-                GetClientName(client, szBotName, sizeof(szBotName));
+            }
+            else
+            {
+                // 清空未分配bot的数据，防止使用旧值
+                g_szAssignedRecName[client][0] = '\0';
+                g_szBotRecFolder[client][0] = '\0';
             }
         }
         
@@ -1884,57 +1772,6 @@ int SelectRoundByBothTeamsEconomy()
     delete hCTBots;
     
     return iBestRound;
-}
-
-// ============================================================================
-// 停止REC播放
-// ============================================================================
-
-void StopCTBotsRec_EconomyMode()
-{
-    for (int i = 1; i <= MaxClients; i++)
-    {
-        if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
-            continue;
-        
-        if (GetClientTeam(i) != CS_TEAM_CT)
-            continue;
-        
-        if (g_bPlayingRoundStartRec[i] && BotMimic_IsPlayerMimicing(i))
-        {
-            BotMimic_StopPlayerMimic(i);
-            g_bPlayingRoundStartRec[i] = false;
-        }
-    }
-}
-
-void StopBotsRec_FullMatchMode()
-{
-    int iTCount = GetAliveTeamCount(CS_TEAM_T);
-    int iCTCount = GetAliveTeamCount(CS_TEAM_CT);
-    int iDifference = iTCount - iCTCount;
-    
-    // 如果 T 方人数大于 CT 2人或以上，不停止
-    if (iDifference >= 2)
-    {
-        return;
-    }
-    
-    // 否则停止所有 CT bot 的 REC
-    for (int i = 1; i <= MaxClients; i++)
-    {
-        if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
-            continue;
-        
-        if (GetClientTeam(i) != CS_TEAM_CT)
-            continue;
-        
-        if (g_bPlayingRoundStartRec[i] && BotMimic_IsPlayerMimicing(i))
-        {
-            BotMimic_StopPlayerMimic(i);
-            g_bPlayingRoundStartRec[i] = false;
-        }
-    }
 }
 
 // ============================================================================
@@ -2462,6 +2299,8 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
                     fVerifyDelay = 0.1;
             }
             
+            fVerifyDelay += GetRandomFloat(0.0, 1.5);
+            
             DataPack pack = new DataPack();
             pack.WriteCell(GetClientUserId(client));
             g_hVerifyTimer[client] = CreateTimer(fVerifyDelay, Timer_VerifyInventory, pack);
@@ -2883,7 +2722,7 @@ public Action Timer_VerifyInventory(Handle hTimer, DataPack pack)
             GetTeamSpecificWeapon(szRequiredItem, iTeam, szBuyItem, sizeof(szBuyItem));
             
             // 尝试购买,如果失败则降级
-            BuyItemWithFallback(client, szBuyItem, 0.1 + (iMissingCount * 0.2));
+            BuyItemWithFallback(client, szBuyItem, 0.2 * iMissingCount);
             iMissingCount++;
         }
     }
@@ -2971,39 +2810,35 @@ bool GetFallbackWeapon(const char[] szItem, int iMoney, char[] szFallback, int i
         if (iMoney >= 1700) { strcopy(szFallback, iMaxLen, "ssg08"); return true; }
     }
     
-    // 步枪降级链: AK47/M4 -> FAMAS/Galil -> SMG
+    // 步枪降级链: AK47/M4 -> FAMAS/Galil -> MAC10/MP9 
     if (StrEqual(szItem, "ak47", false))
     {
         if (iMoney >= 2000) { strcopy(szFallback, iMaxLen, "galilar"); return true; }
-        if (iMoney >= 1200) { strcopy(szFallback, iMaxLen, "ump45"); return true; }
         if (iMoney >= 1050) { strcopy(szFallback, iMaxLen, "mac10"); return true; }
     }
     else if (StrEqual(szItem, "m4a1", false) || StrEqual(szItem, "m4a1_silencer", false))
     {
         if (iMoney >= 2250) { strcopy(szFallback, iMaxLen, "famas"); return true; }
-        if (iMoney >= 1200) { strcopy(szFallback, iMaxLen, "ump45"); return true; }
         if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
     }
     else if (StrEqual(szItem, "aug", false))
     {
         if (iMoney >= 3100) { strcopy(szFallback, iMaxLen, "m4a1"); return true; }
         if (iMoney >= 2250) { strcopy(szFallback, iMaxLen, "famas"); return true; }
-        if (iMoney >= 1200) { strcopy(szFallback, iMaxLen, "ump45"); return true; }
+        if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
     }
     else if (StrEqual(szItem, "sg556", false))
     {
         if (iMoney >= 2700) { strcopy(szFallback, iMaxLen, "ak47"); return true; }
         if (iMoney >= 2000) { strcopy(szFallback, iMaxLen, "galilar"); return true; }
-        if (iMoney >= 1200) { strcopy(szFallback, iMaxLen, "ump45"); return true; }
+        if (iMoney >= 1050) { strcopy(szFallback, iMaxLen, "mac10"); return true; }
     }
     else if (StrEqual(szItem, "famas", false))
     {
-        if (iMoney >= 1200) { strcopy(szFallback, iMaxLen, "ump45"); return true; }
         if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
     }
     else if (StrEqual(szItem, "galilar", false))
     {
-        if (iMoney >= 1200) { strcopy(szFallback, iMaxLen, "ump45"); return true; }
         if (iMoney >= 1050) { strcopy(szFallback, iMaxLen, "mac10"); return true; }
     }
     
@@ -3011,11 +2846,11 @@ bool GetFallbackWeapon(const char[] szItem, int iMoney, char[] szFallback, int i
     if (StrEqual(szItem, "p90", false))
     {
         if (iMoney >= 1500) { strcopy(szFallback, iMaxLen, "mp7"); return true; }
-        if (iMoney >= 1200) { strcopy(szFallback, iMaxLen, "ump45"); return true; }
+        if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
     }
     else if (StrEqual(szItem, "mp7", false))
     {
-        if (iMoney >= 1200) { strcopy(szFallback, iMaxLen, "ump45"); return true; }
+        if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
     }
     
     // 护甲降级: vesthelm -> vest
@@ -3340,6 +3175,132 @@ bool IsPistolRound(int iRound)
 bool IsCurrentRoundPistol()
 {
     return IsPistolRound(g_iCurrentRound);
+}
+
+// ============================================================================
+// 公共辅助函数
+// ============================================================================
+
+/**
+ * 获取bot使用的demo文件夹
+ */
+void GetUseDemoFolder(int client, char[] szOutput, int iMaxLen)
+{
+    if (g_szBotRecFolder[client][0] != '\0')
+    {
+        strcopy(szOutput, iMaxLen, g_szBotRecFolder[client]);
+    }
+    else if (g_bRecFolderSelected && g_szCurrentRecFolder[0] != '\0')
+    {
+        strcopy(szOutput, iMaxLen, g_szCurrentRecFolder);
+    }
+    else
+    {
+        szOutput[0] = '\0';
+    }
+}
+
+/**
+ * 清理客户端所有timer和数据
+ */
+void CleanupClientTimers(int client)
+{
+    // 清理购买timer
+    if (g_hPurchaseTimer[client] != null)
+    {
+        KillTimer(g_hPurchaseTimer[client]);
+        g_hPurchaseTimer[client] = null;
+    }
+    
+    if (g_hPurchaseActions[client] != null)
+    {
+        delete g_hPurchaseActions[client];
+        g_hPurchaseActions[client] = null;
+    }
+    g_iPurchaseActionIndex[client] = 0;
+    
+    // 清理验证timer
+    if (g_hVerifyTimer[client] != null)
+    {
+        KillTimer(g_hVerifyTimer[client]);
+        g_hVerifyTimer[client] = null;
+    }
+    
+    if (g_hFinalInventory[client] != null)
+    {
+        delete g_hFinalInventory[client];
+        g_hFinalInventory[client] = null;
+    }
+    
+    // 清理丢弃timer
+    if (g_hDropTimer[client] != null)
+    {
+        KillTimer(g_hDropTimer[client]);
+        g_hDropTimer[client] = null;
+    }
+    
+    if (g_hDropActions[client] != null)
+    {
+        delete g_hDropActions[client];
+        g_hDropActions[client] = null;
+    }
+    g_iDropActionIndex[client] = 0;
+    
+    // 清理聊天timer
+    if (g_hChatTimer[client] != null)
+    {
+        KillTimer(g_hChatTimer[client]);
+        g_hChatTimer[client] = null;
+    }
+    
+    if (g_hChatActions[client] != null)
+    {
+        delete g_hChatActions[client];
+        g_hChatActions[client] = null;
+    }
+    g_iChatActionIndex[client] = 0;
+    
+    g_bAllowPurchase[client] = false;
+    g_bInventoryVerified[client] = false;
+}
+
+/**
+ * 停止指定队伍bot的REC播放
+ * 
+ * @param iTeam         队伍 (CS_TEAM_T 或 CS_TEAM_CT，0表示所有队伍)
+ * @param bCheckBalance 是否检查人数平衡（仅对CT有效）
+ */
+void StopTeamBotsRec(int iTeam, bool bCheckBalance = false)
+{
+    // 如果需要检查人数平衡
+    if (bCheckBalance && iTeam == CS_TEAM_CT)
+    {
+        int iTCount = GetAliveTeamCount(CS_TEAM_T);
+        int iCTCount = GetAliveTeamCount(CS_TEAM_CT);
+        int iDifference = iTCount - iCTCount;
+        
+        // 如果 T 方人数大于 CT 2人或以上，不停止
+        if (iDifference >= 2)
+        {
+            return;
+        }
+    }
+    
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
+            continue;
+        
+        // 如果指定了队伍，只停止该队伍
+        if (iTeam != 0 && GetClientTeam(i) != iTeam)
+            continue;
+        
+        if (g_bPlayingRoundStartRec[i] && BotMimic_IsPlayerMimicing(i))
+        {
+            BotMimic_StopPlayerMimic(i);
+            g_bPlayingRoundStartRec[i] = false;
+        }
+    }
 }
 
 // ============================================================================
