@@ -124,6 +124,7 @@ bool g_bRoundFreezeTimeValid[31];                     // 标记该回合的冻�
 float g_fAllRoundFreezeTimes[31];                     // 存储所有回合的冻结时间（暂停系统用）
 bool g_bAllRoundFreezeTimeValid[31];                  // 标记所有回合的冻结时间（暂停系统用）
 float g_fStandardFreezeTime = 20.0;                   // 标准冻结时间
+float g_fTeamVerifyDelay[4];                          // 存储每个阵营的验证延迟时间
 
 // SDK偏移量
 int g_BotShared_EnemyVisibleOffset = -1;    // 敌人可见偏移
@@ -265,6 +266,11 @@ public void OnPluginStart()
 
 public void OnMapStart()
 {
+    for (int i = 0; i < 4; i++)
+    {
+        g_fTeamVerifyDelay[i] = 0.0;
+    }
+    
     // 重置rec文件夹选择
     g_szCurrentRecFolder[0] = '\0';
     g_bRecFolderSelected = false;
@@ -426,11 +432,6 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     g_iEconomyMode = view_as<EconomySelectionMode>(g_cvEconomyMode.IntValue);
     g_iRoundMode = view_as<RoundSelectionMode>(g_cvRoundMode.IntValue);
     
-    PrintToServer("[Bot REC] Round %d | Mode: %s | Economy: %s", 
-        g_iCurrentRound,
-        g_iRoundMode == Round_Economy ? "ECONOMY" : "FULL",
-        g_iEconomyMode == Economy_SingleTeam ? "SINGLE" : "BOTH");
-    
     char szMap[64];
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
@@ -453,7 +454,6 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     }
     else if (g_bRecFolderSelected && !g_bRoundFreezeTimeValid[g_iCurrentRound])
     {
-        PrintToServer("[Bot REC] Freeze time not loaded for round %d, reloading...", g_iCurrentRound);
         LoadFreezeTimes(szMap, g_szCurrentRecFolder);
     }
     
@@ -493,22 +493,41 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     else if (g_iRoundMode == Round_FullMatch)
     {
         g_bEconomyBasedSelection = false;
-    }
+        
+        if (g_bRecFolderSelected && g_szCurrentRecFolder[0] != '\0')
+        {
+            float fDemoFreezeTimes[31];
+            bool bDemoFreezeValid[31];
+            if (LoadFreezeTimesForDemo(szMap, g_szCurrentRecFolder, fDemoFreezeTimes, bDemoFreezeValid))
+            {
+                if (bDemoFreezeValid[g_iCurrentRound])
+                {
+                    float fDemoFreeze = fDemoFreezeTimes[g_iCurrentRound];
+                    float fVerifyDelay = fDemoFreeze - 3.0;
+                    if (fVerifyDelay < 0.1)
+                        fVerifyDelay = 0.1;
+                    
+                    g_fTeamVerifyDelay[CS_TEAM_T] = fVerifyDelay;
+                    g_fTeamVerifyDelay[CS_TEAM_CT] = fVerifyDelay;
+                }
+                else
+                {
+                    g_fTeamVerifyDelay[CS_TEAM_T] = 7.0;
+                    g_fTeamVerifyDelay[CS_TEAM_CT] = 7.0;
+                }
+            }
+            else
+            {
+                g_fTeamVerifyDelay[CS_TEAM_T] = 7.0;
+                g_fTeamVerifyDelay[CS_TEAM_CT] = 7.0;
+            }
+        }
+    }    
     
     // 全局模式下的动态暂停系统
-    PrintToServer("[Pause Debug] Checking pause conditions:");
-    PrintToServer("[Pause Debug]   - Round mode: %s", g_iRoundMode == Round_FullMatch ? "FULL" : "ECONOMY");
-    PrintToServer("[Pause Debug]   - Folder selected: %s", g_bRecFolderSelected ? "YES" : "NO");
-    PrintToServer("[Pause Debug]   - Current round: %d", g_iCurrentRound);
-    
     if (g_iRoundMode == Round_FullMatch && g_bRecFolderSelected)
     {
-        PrintToServer("[Pause Debug] Calling ScheduleDynamicPause for round %d", g_iCurrentRound);
         ScheduleDynamicPause(g_iCurrentRound);
-    }
-    else
-    {
-        PrintToServer("[Pause Debug] Skipping pause (conditions not met)");
     }
     
     // 为所有bot分配并播放REC
@@ -618,22 +637,10 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
                         if (g_bPlayingRoundStartRec[iEnemy] && BotMimic_IsPlayerMimicing(iEnemy))
                         {
                             bSeeEnemy = false;  // 敌人确实在播放，不停止
-                            
-                            // 添加调试日志
-                            #if defined DEBUG_MODE
-                            PrintToServer("[Debug] %d sees %d (both playing REC) - NOT stopping", 
-                                client, iEnemy);
-                            #endif
                         }
                         else
                         {
                             bSeeEnemy = BotShared_CanSeeEnemy(client);
-                            
-                            #if defined DEBUG_MODE
-                            if (bSeeEnemy)
-                                PrintToServer("[Debug] %d sees %d (enemy NOT playing) - stopping", 
-                                    client, iEnemy);
-                            #endif
                         }
                     }
                     else
@@ -663,21 +670,10 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
                         BotMimic_IsPlayerMimicing(iAttacker))  // 必须确实在播放
                     {
                         bShouldStopFromDamage = false;
-                        
-                        #if defined DEBUG_MODE
-                        PrintToServer("[Debug] %d damaged by %d (attacker playing REC) - NOT stopping", 
-                            client, iAttacker);
-                        #endif
                     }
                     else
                     {
                         bShouldStopFromDamage = ShouldStopFromDamage(iDamage, g_iLastDamageType[client]);
-                        
-                        #if defined DEBUG_MODE
-                        if (bShouldStopFromDamage)
-                            PrintToServer("[Debug] %d damaged (attacker NOT playing) - stopping", 
-                                client);
-                        #endif
                     }
                 }
                 else
@@ -692,19 +688,6 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
             {
                 BotMimic_StopPlayerMimic(client);
                 g_bPlayingRoundStartRec[client] = false;
-            
-                char szName[MAX_NAME_LENGTH];
-                GetClientName(client, szName, sizeof(szName));
-            
-                char szReason[64];
-                if (bSeeEnemy) 
-                    strcopy(szReason, sizeof(szReason), "saw enemy");
-                else if (bShouldStopFromDamage) 
-                    Format(szReason, sizeof(szReason), "took %d damage (type: %d)", 
-                        iDamage, g_iLastDamageType[client]);
-            
-                PrintToServer("[Bot REC] Client %d (%s) stopped rec: %s", 
-                    client, szName, szReason);
             }
         }
     }
@@ -724,7 +707,6 @@ public void BotMimic_OnPlayerStopsMimicing(int client, char[] name, char[] categ
         BotShared_ResetBotState(client);
 
         g_bPlayingRoundStartRec[client] = false;
-        PrintToServer("[Bot REC] Client %d finished round start rec", client);
         
         // 安全地停止购买timer
         if (g_hPurchaseTimer[client] != null)
@@ -815,8 +797,6 @@ void AssignAndPlayRec(int client)
     char szBotName[MAX_NAME_LENGTH];
     GetClientName(client, szBotName, sizeof(szBotName));
     
-    PrintToServer("[Bot REC] Processing bot %d (%s)", client, szBotName);
-    
     char szRecPath[PLATFORM_MAX_PATH];
     bool bFoundRec = false;
     int iRoundToUse = g_iCurrentRound;
@@ -831,43 +811,26 @@ void AssignAndPlayRec(int client)
         {
             iRoundToUse = iSelectedRound;
             bFoundRec = GetRoundStartRecForRound(client, iSelectedRound, szRecPath, sizeof(szRecPath));
-            PrintToServer("[Bot REC] [Economy Mode] Bot %d using selected round %d", client, iSelectedRound);
-        }
-        else
-        {
-            PrintToServer("[Bot REC] [Economy Mode] Bot %d: No round selected for team %d", client, iTeam);
         }
     }
     else
     {
         bFoundRec = GetRoundStartRec(client, g_iCurrentRound, szRecPath, sizeof(szRecPath));
-        PrintToServer("[Bot REC] [Full Match Mode] Bot %d using current round %d", client, g_iCurrentRound);
     }
     
     if (bFoundRec)
     {
         strcopy(g_szRoundStartRecPath[client], sizeof(g_szRoundStartRecPath[]), szRecPath);
         
-        PrintToServer("[Bot REC] Bot %d assigned rec: %s, rec_index: %d, round: %d", 
-            client, szRecPath, g_iAssignedRecIndex[client], iRoundToUse);
-        
         // 设置金钱 只在全局模式下设置
         if (g_iRoundMode == Round_FullMatch && !g_bRecMoneySet[client] && g_iRecStartMoney[client] > 0)
         {
             SetEntProp(client, Prop_Send, "m_iAccount", g_iRecStartMoney[client]);
             g_bRecMoneySet[client] = true;
-            PrintToServer("[Bot REC] [Full Match] Bot %d money set to: %d", client, g_iRecStartMoney[client]);
-        }
-        else if (g_iRoundMode == Round_Economy)
-        {
-            int iCurrentMoney = GetEntProp(client, Prop_Send, "m_iAccount");
-            PrintToServer("[Bot REC] [Economy] Bot %d keeping current money: $%d", client, iCurrentMoney);
         }
         
         // 加载购买数据
         bool bPurchaseLoaded = LoadPurchaseActionsForBot(client, iRoundToUse);
-        PrintToServer("[Bot REC] Bot %d purchase data loaded: %s", 
-            client, bPurchaseLoaded ? "YES" : "NO");
         
         if (bPurchaseLoaded)
         {
@@ -883,14 +846,10 @@ void AssignAndPlayRec(int client)
             pack.WriteCell(GetClientUserId(client));
             g_hPurchaseTimer[client] = CreateTimer(0.1, Timer_ExecutePurchaseAction, pack, 
                 TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
-            
-            PrintToServer("[Bot REC] Bot %d purchase timer started", client);
         }
 
         // 加载聊天数据
         bool bChatLoaded = LoadChatActionsForBot(client, iRoundToUse);
-        PrintToServer("[Bot REC] Bot %d chat data loaded: %s", 
-            client, bChatLoaded ? "YES" : "NO");
         
         if (bChatLoaded)
         {
@@ -906,16 +865,12 @@ void AssignAndPlayRec(int client)
             pack.WriteCell(GetClientUserId(client));
             g_hChatTimer[client] = CreateTimer(0.1, Timer_ExecuteChatAction, pack, 
                 TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
-            
-            PrintToServer("[Bot REC] Bot %d chat timer started", client);
         }
         
         // 开始播放REC
         g_bPlayingRoundStartRec[client] = true;
         float fGameTime = GetGameTime();
         g_fRecStartTime[client] = fGameTime;
-        
-        PrintToServer("[Bot REC] Bot %d REC start time set to: %.2f", client, fGameTime);
         
         BotMimic_PlayRecordFromFile(client, szRecPath);
         
@@ -924,13 +879,6 @@ void AssignAndPlayRec(int client)
 
         // 设置Bot状态为播放REC
         BotShared_SetBotState(client, BotState_PlayingREC);
-        
-        PrintToServer("[Bot REC] Bot %d playing rec, start_time: %.1f", 
-            client, g_fRecStartTime[client]);
-    }
-    else
-    {
-        PrintToServer("[Bot REC] Bot %d: No rec found for round %d", client, iRoundToUse);
     }
 }
 
@@ -1085,16 +1033,13 @@ bool GetRoundStartRec(int client, int iRound, char[] szPath, int iMaxLen)
             }
         }
         
-        // 如果找不到匹配的REC文件，打印警告并返回false
-        PrintToServer("[Bot REC] WARNING: Assigned REC '%s' not found for client %d", 
-            szAssignedRecName, client);
+        // 如果找不到匹配的REC文件，返回false
         delete hRecFiles;
         return false;
     }
     else if (g_bEconomyBasedSelection)
     {
         // 经济模式下，如果找不到分配列表，返回false
-        PrintToServer("[Bot REC] WARNING: No assigned REC name for client %d in economy mode", client);
         delete hRecFiles;
         return false;
     }
@@ -1178,7 +1123,6 @@ bool GetRoundStartMoney(int client, int iRound)
     
     if (!FileExists(szJsonPath))
     {
-        PrintToServer("[Bot Money] File not found: %s", szJsonPath);
         g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
         return true;
     }
@@ -1186,7 +1130,6 @@ bool GetRoundStartMoney(int client, int iRound)
     JSONObject jRoot = JSONObject.FromFile(szJsonPath);
     if (jRoot == null)
     {
-        PrintToServer("[Bot Money] Failed to parse JSON");
         g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
         return false;
     }
@@ -1196,7 +1139,6 @@ bool GetRoundStartMoney(int client, int iRound)
     
     if (!jRoot.HasKey(szRoundKey))
     {
-        PrintToServer("[Bot Money] No data for %s", szRoundKey);
         delete jRoot;
         g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
         return true;
@@ -1205,7 +1147,6 @@ bool GetRoundStartMoney(int client, int iRound)
     JSONObject jRound = view_as<JSONObject>(jRoot.Get(szRoundKey));
     if (!jRound.HasKey(szTeamName))
     {
-        PrintToServer("[Bot Money] Round %s has no data for team %s", szRoundKey, szTeamName);
         delete jRound;
         delete jRoot;
         g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
@@ -1219,11 +1160,6 @@ bool GetRoundStartMoney(int client, int iRound)
     {
         g_iRecStartMoney[client] = jTeam.GetInt(g_szCurrentRecName[client]);
         
-        char szBotName[MAX_NAME_LENGTH];
-        GetClientName(client, szBotName, sizeof(szBotName));
-        PrintToServer("[Bot Money] Client %d (%s) using REC name '%s': $%d", 
-            client, szBotName, g_szCurrentRecName[client], g_iRecStartMoney[client]);
-        
         delete jTeam;
         delete jRound;
         delete jRoot;
@@ -1231,9 +1167,6 @@ bool GetRoundStartMoney(int client, int iRound)
     }
     
     // 失败则使用默认值
-    PrintToServer("[Bot Money] WARNING: No money data found for client %d (rec: '%s'), using default", 
-        client, g_szCurrentRecName[client]);
-    
     delete jTeam;
     delete jRound;
     delete jRoot;
@@ -1268,7 +1201,6 @@ void SelectRoundByEconomy(int iTeam)
     if (iBotCount == 0)
     {
         delete hTeamBots;
-        PrintToServer("[Economy Hybrid] No bots in team %s", szTeamName);
         return;
     }
     
@@ -1282,9 +1214,6 @@ void SelectRoundByEconomy(int iTeam)
         int client = hTeamBots.Get(i);
         iTotalMoney += GetEntProp(client, Prop_Send, "m_iAccount");
     }
-    
-    PrintToServer("[Economy Hybrid] Team %s - Bot count: %d, Total money: $%d", 
-        szTeamName, iBotCount, iTotalMoney);
     
     // 判断是否所有bot经济都小于3000
     bool bAllUnder3000 = true;
@@ -1301,9 +1230,6 @@ void SelectRoundByEconomy(int iTeam)
     // 判断当前是否手枪局
     bool bCurrentIsPistol = IsCurrentRoundPistol();
     
-    PrintToServer("[Economy Hybrid] Team %s - All under $3000: %s, Current is pistol: %s",
-        szTeamName, bAllUnder3000 ? "YES" : "NO", bCurrentIsPistol ? "YES" : "NO");
-    
     // 获取地图和所有demo文件夹
     char szMap[64];
     GetCurrentMap(szMap, sizeof(szMap));
@@ -1314,7 +1240,6 @@ void SelectRoundByEconomy(int iTeam)
     
     if (!DirExists(szMapBasePath))
     {
-        PrintToServer("[Economy Hybrid] ERROR: Map path does not exist: %s", szMapBasePath);
         delete hTeamBots;
         return;
     }
@@ -1336,30 +1261,22 @@ void SelectRoundByEconomy(int iTeam)
         delete hMapDir;
     }
     
-    PrintToServer("[Economy Hybrid] Found %d demo folders", hDemoFolders.Length);
-    
     int iBestRound = -1;
     char szBestDemo[PLATFORM_MAX_PATH];
     int iBestValue = bAllUnder3000 ? 999999 : 0;
     KnapsackResult bestResult;
     bestResult.isValid = false;
     
-    int iValidRoundsChecked = 0;
-    int iRoundsWithData = 0;
-    
     for (int d = 0; d < hDemoFolders.Length; d++)
     {
         char szDemoFolder[PLATFORM_MAX_PATH];
         hDemoFolders.GetString(d, szDemoFolder, sizeof(szDemoFolder));
-        
-        PrintToServer("[Economy Hybrid] Checking demo folder: %s", szDemoFolder);
         
         // 加载该demo的freeze时间
         float fDemoFreezeTimes[31];
         bool bDemoFreezeValid[31];
         if (!LoadFreezeTimesForDemo(szMap, szDemoFolder, fDemoFreezeTimes, bDemoFreezeValid))
         {
-            PrintToServer("[Economy Hybrid]   - No valid freeze times, skipping");
             continue;
         }
         
@@ -1367,7 +1284,6 @@ void SelectRoundByEconomy(int iTeam)
         JSONObject jDemoPurchaseData = LoadPurchaseDataForDemo(szMap, szDemoFolder);
         if (jDemoPurchaseData == null)
         {
-            PrintToServer("[Economy Hybrid]   - No purchase data, skipping");
             continue;
         }
         
@@ -1376,8 +1292,6 @@ void SelectRoundByEconomy(int iTeam)
         {
             if (!bDemoFreezeValid[iRound])
                 continue;
-            
-            iValidRoundsChecked++;
             
             // 手枪局匹配检查
             bool bRoundIsPistol = IsPistolRound(iRound);
@@ -1397,30 +1311,23 @@ void SelectRoundByEconomy(int iTeam)
                 continue;
             }
             
-            iRoundsWithData++;
-            
             JSONObject jTeam = view_as<JSONObject>(jRound.Get(szTeamName));
             
             // 获取该回合的REC文件列表
             ArrayList hRecFiles = GetRecFilesForRound(szMap, szDemoFolder, iRound, szTeamName);
             if (hRecFiles.Length == 0)
             {
-                PrintToServer("[Economy Hybrid]   - Round %d: No REC files found", iRound + 1);
                 delete hRecFiles;
                 delete jTeam;
                 delete jRound;
                 continue;
             }
             
-            PrintToServer("[Economy Hybrid]   - Round %d: Found %d REC files", 
-                iRound + 1, hRecFiles.Length);
-            
             // 构建REC装备信息缓存
             ArrayList hRecInfoList = BuildRecEquipmentCache(hRecFiles, jTeam, iTeam);
             
             if (hRecInfoList.Length == 0)
             {
-                PrintToServer("[Economy Hybrid]   - Round %d: No valid REC info", iRound + 1);
                 delete hRecInfoList;
                 delete hRecFiles;
                 delete jTeam;
@@ -1451,18 +1358,11 @@ void SelectRoundByEconomy(int iTeam)
                 
                 if (bIsBetter)
                 {
-                    PrintToServer("[Economy Hybrid]   - Round %d: NEW BEST (value=%d, cost=$%d)",
-                        iRound + 1, dpResult.totalValue, dpResult.totalCost);
-                    
                     iBestRound = iRound;
                     strcopy(szBestDemo, sizeof(szBestDemo), szDemoFolder);
                     iBestValue = dpResult.totalValue;
                     bestResult = dpResult;
                 }
-            }
-            else
-            {
-                PrintToServer("[Economy Hybrid]   - Round %d: DP result invalid", iRound + 1);
             }
             
             delete hRecInfoList;
@@ -1474,20 +1374,12 @@ void SelectRoundByEconomy(int iTeam)
         delete jDemoPurchaseData;
     }
     
-    PrintToServer("[Economy Hybrid] Team %s - Checked %d valid rounds, %d with data",
-        szTeamName, iValidRoundsChecked, iRoundsWithData);
-    
     if (iBestRound == -1)
     {
-        PrintToServer("[Economy Hybrid] Team %s: NO affordable round found! (Checked %d demos)",
-            szTeamName, hDemoFolders.Length);
         delete hDemoFolders;
         delete hTeamBots;
         return;
     }
-    
-    PrintToServer("[Economy Hybrid] Team %s: BEST ROUND = %d from demo '%s' (value=%d)",
-        szTeamName, iBestRound + 1, szBestDemo, iBestValue);
     
     // 重新加载最佳回合的数据并打印详情
     ArrayList hBestRecFiles = GetRecFilesForRound(szMap, szBestDemo, iBestRound, szTeamName);
@@ -1511,13 +1403,33 @@ void SelectRoundByEconomy(int iTeam)
     g_iSelectedRoundForTeam[iTeam] = iBestRound;
     strcopy(g_szSelectedDemoForTeam[iTeam], PLATFORM_MAX_PATH, szBestDemo);
     
+    float fDemoFreezeTimes[31];
+    bool bDemoFreezeValid[31];
+    if (LoadFreezeTimesForDemo(szMap, szBestDemo, fDemoFreezeTimes, bDemoFreezeValid))
+    {
+        if (bDemoFreezeValid[iBestRound])
+        {
+            float fDemoFreeze = fDemoFreezeTimes[iBestRound];
+            g_fTeamVerifyDelay[iTeam] = fDemoFreeze - 3.0;
+            if (g_fTeamVerifyDelay[iTeam] < 0.1)
+                g_fTeamVerifyDelay[iTeam] = 0.1;
+        }
+        else
+        {
+            g_fTeamVerifyDelay[iTeam] = 7.0;
+        }
+    }
+    else
+    {
+        g_fTeamVerifyDelay[iTeam] = 7.0;
+    }
+    
     // 清理旧的分配列表
     if (g_hAssignedRecsForTeam[iTeam] != null)
         delete g_hAssignedRecsForTeam[iTeam];
     g_hAssignedRecsForTeam[iTeam] = new ArrayList(ByteCountToCells(PLATFORM_MAX_PATH));
     
     // 应用最终分配并模拟发枪
-    int iTotalCost = 0;
     for (int b = 0; b < iBotCount; b++)
     {
         int client = hTeamBots.Get(b);
@@ -1533,19 +1445,8 @@ void SelectRoundByEconomy(int iTeam)
             // 直接保存到bot专属变量
             strcopy(g_szAssignedRecName[client], PLATFORM_MAX_PATH, recInfo.recName);
             strcopy(g_szBotRecFolder[client], PLATFORM_MAX_PATH, szBestDemo);
-            
-            iTotalCost += recInfo.totalCost;
-            
-            char szBotName[MAX_NAME_LENGTH];
-            GetClientName(client, szBotName, sizeof(szBotName));
-            
-            PrintToServer("[Economy Hybrid]   - Bot %d (%s): assigned '%s' (cost=$%d)",
-                client, szBotName, recInfo.recName, recInfo.totalCost);
         }
     }
-    
-    PrintToServer("[Economy Hybrid] Team %s: Final total cost = $%d / $%d",
-        szTeamName, iTotalCost, iTotalMoney);
     
     // 虚拟发枪模拟
     SimulateDropSystem(hTeamBots, optimizedResult, hBestRecInfoList);
@@ -1562,13 +1463,9 @@ void SelectRoundByEconomy(int iTeam)
 
 int SelectRoundByBothTeamsEconomy()
 {
-    PrintToServer("[Economy Both] ===== Starting Both Teams Economy Selection =====");
-    
     char szMap[64];
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
-    
-    PrintToServer("[Economy Both] Current map: %s", szMap);
     
     // 收集两个阵营的所有bot
     ArrayList hTBots = new ArrayList();
@@ -1595,13 +1492,10 @@ int SelectRoundByBothTeamsEconomy()
     
     if (iTBotCount == 0 && iCTBotCount == 0)
     {
-        PrintToServer("[Economy Both] ERROR: No bots found in either team!");
         delete hTBots;
         delete hCTBots;
         return g_iCurrentRound;
     }
-    
-    PrintToServer("[Economy Both] T bots: %d, CT bots: %d", iTBotCount, iCTBotCount);
 
     // 计算团队总经济
     int iTTotalMoney = 0;
@@ -1815,7 +1709,6 @@ int SelectRoundByBothTeamsEconomy()
     
     if (iBestRound == -1)
     {
-        PrintToServer("[Economy Both] No affordable round found!");
         delete hTBots;
         delete hCTBots;
         return g_iCurrentRound;
@@ -1880,6 +1773,32 @@ int SelectRoundByBothTeamsEconomy()
     strcopy(g_szSelectedDemoForTeam[CS_TEAM_T], PLATFORM_MAX_PATH, szBestDemo);
     strcopy(g_szSelectedDemoForTeam[CS_TEAM_CT], PLATFORM_MAX_PATH, szBestDemo);
     
+    float fDemoFreezeTimes[31];
+    bool bDemoFreezeValid[31];
+    if (LoadFreezeTimesForDemo(szMap, szBestDemo, fDemoFreezeTimes, bDemoFreezeValid))
+    {
+        if (bDemoFreezeValid[iBestRound])
+        {
+            float fDemoFreeze = fDemoFreezeTimes[iBestRound];
+            float fVerifyDelay = fDemoFreeze - 3.0;
+            if (fVerifyDelay < 0.1)
+                fVerifyDelay = 0.1;
+            
+            g_fTeamVerifyDelay[CS_TEAM_T] = fVerifyDelay;
+            g_fTeamVerifyDelay[CS_TEAM_CT] = fVerifyDelay;
+        }
+        else
+        {
+            g_fTeamVerifyDelay[CS_TEAM_T] = 7.0;
+            g_fTeamVerifyDelay[CS_TEAM_CT] = 7.0;
+        }
+    }
+    else
+    {
+        g_fTeamVerifyDelay[CS_TEAM_T] = 7.0;
+        g_fTeamVerifyDelay[CS_TEAM_CT] = 7.0;
+    }
+    
     // 清理旧分配列表
     if (g_hAssignedRecsForTeam[CS_TEAM_T] != null)
         delete g_hAssignedRecsForTeam[CS_TEAM_T];
@@ -1911,9 +1830,6 @@ int SelectRoundByBothTeamsEconomy()
                 // 直接保存到bot专属变量
                 strcopy(g_szAssignedRecName[client], PLATFORM_MAX_PATH, recInfo.recName);
                 strcopy(g_szBotRecFolder[client], PLATFORM_MAX_PATH, szBestDemo);
-                
-                char szBotName[MAX_NAME_LENGTH];
-                GetClientName(client, szBotName, sizeof(szBotName));
             }
         }
         
@@ -1976,8 +1892,6 @@ int SelectRoundByBothTeamsEconomy()
 
 void StopCTBotsRec_EconomyMode()
 {
-    int iStoppedCount = 0;
-    
     for (int i = 1; i <= MaxClients; i++)
     {
         if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
@@ -1990,15 +1904,7 @@ void StopCTBotsRec_EconomyMode()
         {
             BotMimic_StopPlayerMimic(i);
             g_bPlayingRoundStartRec[i] = false;
-            iStoppedCount++;
-            
-            PrintToServer("[Bot REC] CT bot %d stopped REC after bomb plant", i);
         }
-    }
-    
-    if (iStoppedCount > 0)
-    {
-        PrintToServer("[Bot REC] Stopped %d CT bots after bomb plant", iStoppedCount);
     }
 }
 
@@ -2008,19 +1914,13 @@ void StopBotsRec_FullMatchMode()
     int iCTCount = GetAliveTeamCount(CS_TEAM_CT);
     int iDifference = iTCount - iCTCount;
     
-    PrintToServer("[Bot REC] Full Match Mode: T=%d, CT=%d, Diff=%d", 
-        iTCount, iCTCount, iDifference);
-    
     // 如果 T 方人数大于 CT 2人或以上，不停止
     if (iDifference >= 2)
     {
-        PrintToServer("[Bot REC] T has 2+ more players, keeping REC");
         return;
     }
     
     // 否则停止所有 CT bot 的 REC
-    int iStoppedCount = 0;
-    
     for (int i = 1; i <= MaxClients; i++)
     {
         if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
@@ -2033,13 +1933,7 @@ void StopBotsRec_FullMatchMode()
         {
             BotMimic_StopPlayerMimic(i);
             g_bPlayingRoundStartRec[i] = false;
-            iStoppedCount++;
         }
-    }
-    
-    if (iStoppedCount > 0)
-    {
-        PrintToServer("[Bot REC] Stopped %d CT bots", iStoppedCount);
     }
 }
 
@@ -2059,7 +1953,6 @@ bool LoadPurchaseDataFile(const char[] szRecFolder)
     
     if (!FileExists(szPath))
     {
-        PrintToServer("[Bot REC] Purchase data file not found: %s", szPath);
         return false;
     }
     
@@ -2071,7 +1964,6 @@ bool LoadPurchaseDataFile(const char[] szRecFolder)
     g_jPurchaseData = JSONObject.FromFile(szPath);
     if (g_jPurchaseData == null)
     {
-        PrintToServer("[Bot REC] Failed to parse purchase data JSON");
         return false;
     }
     
@@ -2085,10 +1977,7 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
     BuildPath(Path_SM, szFreezePath, sizeof(szFreezePath), 
         "data/botmimic/all/%s/%s/freeze.txt", szMap, szRecFolder);
     
-    PrintToServer("[Freeze Loader] ===== LoadFreezeTimes CALLED =====");
-    PrintToServer("[Freeze Loader] Map: %s", szMap);
-    PrintToServer("[Freeze Loader] Folder: %s", szRecFolder);
-    PrintToServer("[Freeze Loader] Path: %s", szFreezePath);
+    PrintToServer("[Freeze Loader] Loading freeze times from: %s", szFreezePath);
     
     // 初始化所有回合为无效
     for (int i = 0; i < sizeof(g_bRoundFreezeTimeValid); i++)
@@ -2106,14 +1995,13 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
     
     if (!FileExists(szFreezePath))
     {
-        PrintToServer("[Freeze Loader] ✗ File not found: %s", szFreezePath);
+        PrintToServer("[Freeze Loader] File not found: %s", szFreezePath);
         return false;
     }
     
     File hFile = OpenFile(szFreezePath, "r");
     if (hFile == null)
     {
-        PrintToServer("[Freeze Loader] ✗ Failed to open file");
         return false;
     }
     
@@ -2121,9 +2009,6 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
     int iValidRoundsForEconomy = 0;
     int iValidRoundsForPause = 0;
     const float TOLERANCE = 2.0;
-    int iLineNumber = 0;
-    
-    PrintToServer("[Freeze Loader] Parsing file...");
     
     // 先扫描一遍找标准冻结时间
     while (hFile.ReadLine(szLine, sizeof(szLine)))
@@ -2143,8 +2028,6 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
                 ReplaceString(szParts[1], sizeof(szParts[]), "秒", "");
                 ReplaceString(szParts[1], sizeof(szParts[]), "s", "", false);
                 g_fStandardFreezeTime = StringToFloat(szParts[1]);
-                
-                PrintToServer("[Freeze Loader] Found standard freeze time = %.2f", g_fStandardFreezeTime);
             }
             break;
         }
@@ -2155,21 +2038,17 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
     hFile = OpenFile(szFreezePath, "r");
     if (hFile == null)
     {
-        PrintToServer("[Freeze Loader] ✗ Failed to reopen file");
         return false;
     }
     
     // 第二遍扫描：解析回合数据
-    iLineNumber = 0;
     while (hFile.ReadLine(szLine, sizeof(szLine)))
     {
-        iLineNumber++;
         TrimString(szLine);
         
         // 跳过空行和注释
         if (strlen(szLine) == 0 || szLine[0] == '/' || szLine[0] == '#')
         {
-            PrintToServer("[Freeze Loader] Line %d: Skipped (empty/comment)", iLineNumber);
             continue;
         }
         
@@ -2178,7 +2057,6 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
             StrContains(szLine, "standard", false) != -1 ||
             StrContains(szLine, "freeze", false) != -1)
         {
-            PrintToServer("[Freeze Loader] Line %d: Skipped (standard time definition)", iLineNumber);
             continue;
         }
         
@@ -2188,8 +2066,6 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
         
         if (iParts < 2)
         {
-            PrintToServer("[Freeze Loader] Line %d: Invalid format (no colon): %s", 
-                iLineNumber, szLine);
             continue;
         }
         
@@ -2212,8 +2088,6 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
         
         if (iRoundNum < 1 || iRoundNum > 30)
         {
-            PrintToServer("[Freeze Loader] Line %d: Invalid round number: %d (must be 1-30)", 
-                iLineNumber, iRoundNum);
             continue;
         }
         
@@ -2225,8 +2099,6 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
         
         if (fFreezeTime <= 0.0)
         {
-            PrintToServer("[Freeze Loader] Line %d: Invalid freeze time: %.2f", 
-                iLineNumber, fFreezeTime);
             continue;
         }
         
@@ -2240,9 +2112,6 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
         g_fAllRoundFreezeTimes[iArrayIndex] = fFreezeTime;
         iValidRoundsForPause++;
         
-        PrintToServer("[Freeze Loader] Line %d: [PAUSE] Round %d (index %d) = %.2f seconds", 
-            iLineNumber, iRoundNum, iArrayIndex, fFreezeTime);
-        
         // 2. 经济系统：只加载tolerance范围内的时间
         float fDifference = FloatAbs(fFreezeTime - g_fStandardFreezeTime);
         
@@ -2251,52 +2120,13 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
             g_bRoundFreezeTimeValid[iArrayIndex] = true;
             g_fValidRoundFreezeTimes[iArrayIndex] = fFreezeTime;
             iValidRoundsForEconomy++;
-            
-            PrintToServer("[Freeze Loader] Line %d: [ECONOMY] ✓ Round %d (index %d) = %.2f seconds (diff: %.2f)", 
-                iLineNumber, iRoundNum, iArrayIndex, fFreezeTime, fDifference);
-        }
-        else
-        {
-            PrintToServer("[Freeze Loader] Line %d: [ECONOMY] ✗ Round %d rejected (freeze: %.2f, standard: %.2f, diff: %.2f > tolerance: %.2f)", 
-                iLineNumber, iRoundNum, fFreezeTime, g_fStandardFreezeTime, fDifference, TOLERANCE);
         }
     }
     
     delete hFile;
     
-    PrintToServer("[Freeze Loader] ===== PARSING COMPLETE =====");
-    PrintToServer("[Freeze Loader] Total lines: %d", iLineNumber);
-    PrintToServer("[Freeze Loader] Valid rounds for PAUSE system: %d", iValidRoundsForPause);
-    PrintToServer("[Freeze Loader] Valid rounds for ECONOMY system: %d", iValidRoundsForEconomy);
-    PrintToServer("[Freeze Loader] Standard freeze time: %.2f seconds", g_fStandardFreezeTime);
-    
-    // 打印暂停系统的摘要
-    if (iValidRoundsForPause > 0)
-    {
-        PrintToServer("[Freeze Loader] Pause system rounds:");
-        for (int i = 0; i < 31; i++)
-        {
-            if (g_bAllRoundFreezeTimeValid[i])
-            {
-                PrintToServer("[Freeze Loader]   - Index %d (round%d): %.2f seconds", 
-                    i, i + 1, g_fAllRoundFreezeTimes[i]);
-            }
-        }
-    }
-    
-    // 打印经济系统的摘要
-    if (iValidRoundsForEconomy > 0)
-    {
-        PrintToServer("[Freeze Loader] Economy system rounds:");
-        for (int i = 0; i < 31; i++)
-        {
-            if (g_bRoundFreezeTimeValid[i])
-            {
-                PrintToServer("[Freeze Loader]   - Index %d (round%d): %.2f seconds", 
-                    i, i + 1, g_fValidRoundFreezeTimes[i]);
-            }
-        }
-    }
+    PrintToServer("[Freeze Loader] Loaded %d rounds for pause, %d rounds for economy", 
+        iValidRoundsForPause, iValidRoundsForEconomy);
     
     return (iValidRoundsForPause > 0 || iValidRoundsForEconomy > 0);
 }
@@ -2314,7 +2144,6 @@ bool LoadChatDataFile(const char[] szRecFolder)
     
     if (!FileExists(szPath))
     {
-        PrintToServer("[Bot Chat] Chat data file not found: %s", szPath);
         return false;
     }
     
@@ -2326,12 +2155,10 @@ bool LoadChatDataFile(const char[] szRecFolder)
     g_jChatData = view_as<JSONArray>(JSONArray.FromFile(szPath));
     if (g_jChatData == null)
     {
-        PrintToServer("[Bot Chat] Failed to parse chat data JSON");
         return false;
     }
     
-    PrintToServer("[Bot Chat] Loaded chat data from: %s (messages: %d)", 
-        szPath, g_jChatData.Length);
+    PrintToServer("[Bot REC] Loaded chat data from: %s", szPath);
     return true;
 }
 
@@ -2339,14 +2166,12 @@ bool LoadChatActionsForBot(int client, int iRound)
 {
     if (g_jChatData == null)
     {
-        PrintToServer("[Bot Chat] No chat data loaded");
         return false;
     }
     
     // 获取bot的REC名称
     if (g_szCurrentRecName[client][0] == '\0')
     {
-        PrintToServer("[Bot Chat] Client %d has no rec name assigned", client);
         return false;
     }
     
@@ -2401,14 +2226,8 @@ bool LoadChatActionsForBot(int client, int iRound)
         g_hChatActions[client].PushString(szChatAction);
         iChatCount++;
         
-        PrintToServer("[Bot Chat]   Chat %d: %.2fs - %s (team=%d)", 
-            iChatCount, fTime, szMessage, bIsTeamChat ? 1 : 0);
-        
         delete jMessage;
     }
-    
-    PrintToServer("[Bot Chat] Loaded %d chat messages for client %d (rec: %s)", 
-        iChatCount, client, szBotRecName);
     
     return (iChatCount > 0);
 }
@@ -2454,11 +2273,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     if (g_szBotRecFolder[client][0] != '\0')
     {
         jUsePurchaseData = LoadPurchaseDataForDemo(szMap, g_szBotRecFolder[client]);
-        if (jUsePurchaseData == null)
-        {
-            PrintToServer("[Bot Purchase] Failed to load purchase data for bot %d demo: %s", 
-                client, g_szBotRecFolder[client]);
-        }
     }
     
     // 如果没有专属数据，使用全局数据
@@ -2469,7 +2283,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     
     if (jUsePurchaseData == null)
     {
-        PrintToServer("[Bot Purchase] ERROR: No purchase data for client %d", client);
         return false;
     }
     
@@ -2495,8 +2308,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     // 使用正确的数据源
     if (!jUsePurchaseData.HasKey(szRoundKey))
     {
-        PrintToServer("[Bot Purchase] ERROR: No purchase data for %s", szRoundKey);
-        
         // 清理临时数据
         if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
             delete jUsePurchaseData;
@@ -2507,8 +2318,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     JSONObject jRound = view_as<JSONObject>(jUsePurchaseData.Get(szRoundKey));
     if (!jRound.HasKey(szTeamName))
     {
-        PrintToServer("[Bot Purchase] ERROR: Round %s has no data for team %s", 
-            szRoundKey, szTeamName);
         delete jRound;
         
         // 清理临时数据
@@ -2523,7 +2332,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     // 使用rec文件名而不是索引
     if (g_szCurrentRecName[client][0] == '\0')
     {
-        PrintToServer("[Bot Purchase] ERROR: Client %d has no rec name assigned", client);
         delete jTeam;
         delete jRound;
         
@@ -2536,8 +2344,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     
     if (!jTeam.HasKey(g_szCurrentRecName[client]))
     {
-        PrintToServer("[Bot Purchase] ERROR: Team %s has no data for rec name '%s'", 
-            szTeamName, g_szCurrentRecName[client]);
         delete jTeam;
         delete jRound;
         
@@ -2574,9 +2380,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     {
         JSONArray jPurchases = view_as<JSONArray>(jBotData.Get("purchases"));
         
-        PrintToServer("[Bot Purchase] Found %d purchase actions for client %d", 
-            jPurchases.Length, client);
-        
         for (int i = 0; i < jPurchases.Length; i++)
         {
             JSONObject jAction = view_as<JSONObject>(jPurchases.Get(i));
@@ -2597,7 +2400,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
                 Format(szActionStr, sizeof(szActionStr), "%.1f|%s|%s", fTime, szItem, szSlot);
                 g_hPurchaseActions[client].PushString(szActionStr);
                 
-                PrintToServer("[Bot Purchase]   Action %d: BUY %s at %.2fs", i, szItem, fTime);
                 iPurchaseCount++;
             }
             // 处理丢弃动作
@@ -2627,15 +2429,12 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     {
         JSONArray jInventory = view_as<JSONArray>(jBotData.Get("final_inventory"));
         
-        PrintToServer("[Bot Purchase] Loading final inventory for client %d:", client);
-        
         for (int i = 0; i < jInventory.Length; i++)
         {
             char szItem[64];
             jInventory.GetString(i, szItem, sizeof(szItem));
             g_hFinalInventory[client].PushString(szItem);
             
-            PrintToServer("[Bot Purchase]   Inventory %d: %s", i, szItem);
             iInventoryCount++;
         }
         
@@ -2646,7 +2445,7 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     delete jTeam;
     delete jRound;
     
-    // 设置装备验证定时器 - 在冻结时间50%时触发
+    // 设置装备验证定时器
     ConVar cvFreezeTime = FindConVar("mp_freezetime");
     if (cvFreezeTime != null)
     {
@@ -2654,26 +2453,21 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
         
         if (fFreezeTime > 3.0 && g_hFinalInventory[client].Length > 0)
         {
-            // 在冻结时间的50%时开始验证
-            float fVerifyDelay = fFreezeTime * 0.5;
+            float fVerifyDelay = g_fTeamVerifyDelay[iTeam];
+            
+            if (fVerifyDelay <= 0.0)
+            {
+                fVerifyDelay = fFreezeTime - 3.0;
+                if (fVerifyDelay < 0.1)
+                    fVerifyDelay = 0.1;
+            }
+            
             DataPack pack = new DataPack();
             pack.WriteCell(GetClientUserId(client));
             g_hVerifyTimer[client] = CreateTimer(fVerifyDelay, Timer_VerifyInventory, pack);
-            
-            PrintToServer("[Bot Purchase] Verify timer set for client %d: delay=%.2fs", 
-                client, fVerifyDelay);
-        }
-        else
-        {
-            PrintToServer("[Bot Purchase] NOT setting verify timer: freezetime=%.1f, inventory_count=%d", 
-                fFreezeTime, g_hFinalInventory[client] != null ? g_hFinalInventory[client].Length : 0);
         }
     }
-    else
-    {
-        PrintToServer("[Bot Purchase] ERROR: mp_freezetime cvar not found!");
-    }
-    
+
     // 如果有丢弃动作且功能已启用，启动丢弃timer
     if (iDropCount > 0 && g_cvEnableDrops.BoolValue) 
     {
@@ -2681,8 +2475,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
         pack.WriteCell(GetClientUserId(client));
         g_hDropTimer[client] = CreateTimer(0.1, Timer_ExecuteDropAction, pack, 
             TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
-    
-        PrintToServer("[Bot Drop] Bot %d drop timer started with %d actions", client, iDropCount);
     }
     
     // 如果使用的是临时加载的数据，需要删除
@@ -2691,11 +2483,8 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
         delete jUsePurchaseData;
     }
     
-    PrintToServer("[Bot Purchase] Summary for client %d: purchases=%d, drops=%d, final_inventory=%d", 
-        client, iPurchaseCount, iDropCount, iInventoryCount);
-    
     return (iPurchaseCount > 0 || iDropCount > 0 || iInventoryCount > 0);
-}
+}                
 
 // 执行购买动作的定时器
 public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
@@ -2729,16 +2518,6 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
     float fCurrentTime = GetGameTime() - g_fRecStartTime[client];
     int iTeam = GetClientTeam(client);
     
-    // 调试日志
-    static int iDebugCount[MAXPLAYERS+1];
-    iDebugCount[client]++;
-    if (iDebugCount[client] <= 3)  // 只打印前3次
-    {
-        PrintToServer("[Bot Purchase DEBUG] Client %d: InBuyZone=%d, CurrentTime=%.2f, RecStartTime=%.2f, ActionsCount=%d, CurrentIndex=%d", 
-            client, bInBuyZone, fCurrentTime, g_fRecStartTime[client], 
-            g_hPurchaseActions[client].Length, g_iPurchaseActionIndex[client]);
-    }
-    
     if (!bInBuyZone)
         return Plugin_Continue;
     
@@ -2768,7 +2547,6 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
         // 检查是否应该跳过此购买
         if (ShouldSkipPurchase(client, szOriginalItem))
         {
-            PrintToServer("[Bot Purchase] Client %d skipping purchase: %s", client, szOriginalItem);
             g_iPurchaseActionIndex[client]++;
             continue;
         }
@@ -2777,21 +2555,13 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
         char szBuyItem[64];
         bool bNeedConvert = GetTeamSpecificWeapon(szOriginalItem, iTeam, szBuyItem, sizeof(szBuyItem));
         
-        if (bNeedConvert)
-        {
-            PrintToServer("[Bot Purchase] Client %d converting '%s' to '%s'", 
-                client, szOriginalItem, szBuyItem);
-        }
-        else
+        if (!bNeedConvert)
         {
             strcopy(szBuyItem, sizeof(szBuyItem), szOriginalItem);
         }
         
         // 执行购买
         g_bAllowPurchase[client] = true;
-        
-        PrintToServer("[Bot Purchase] Client %d buying: %s (converted from: %s) at time %.2f", 
-            client, szBuyItem, szOriginalItem, fCurrentTime);
         
         FakeClientCommand(client, "buy %s", szBuyItem);
         
@@ -2959,11 +2729,6 @@ public Action Timer_ExecuteChatAction(Handle hTimer, DataPack pack)
             FakeClientCommand(client, "say %s", szMessage);
         }
         
-        char szBotName[MAX_NAME_LENGTH];
-        GetClientName(client, szBotName, sizeof(szBotName));
-        PrintToServer("[Bot Chat] %s said: %s (team=%d)", 
-            szBotName, szMessage, bIsTeamChat ? 1 : 0);
-        
         g_iChatActionIndex[client]++;
     }
     
@@ -2978,7 +2743,7 @@ public Action Timer_ExecuteChatAction(Handle hTimer, DataPack pack)
 }
 
 // ============================================================================
-// 带包检测和捡枪系统
+// 带包检测和枪枪系统
 // ============================================================================
 
 // 检查带包T是否在播放REC
@@ -3014,25 +2779,14 @@ public Action Timer_CheckBombCarrier(Handle hTimer)
     
     if (iBombCarrier == -1)
     {
-        PrintToServer("[Bot REC] No bomb carrier found at 90s check");
         return Plugin_Stop;
     }
     
     // 如果带包T正在播放REC，停止它
     if (g_bPlayingRoundStartRec[iBombCarrier] && BotMimic_IsPlayerMimicing(iBombCarrier))
     {
-        char szName[MAX_NAME_LENGTH];
-        GetClientName(iBombCarrier, szName, sizeof(szName));
-        
         BotMimic_StopPlayerMimic(iBombCarrier);
         g_bPlayingRoundStartRec[iBombCarrier] = false;
-        
-        PrintToServer("[Bot REC] Stopped bomb carrier (client %d: %s) REC at 90 seconds", 
-            iBombCarrier, szName);
-    }
-    else
-    {
-        PrintToServer("[Bot REC] Bomb carrier (client %d) is not playing REC", iBombCarrier);
     }
     
     return Plugin_Stop;
@@ -3193,14 +2947,6 @@ public Action Timer_BuyItemWithFallback(Handle hTimer, DataPack pack)
         g_bAllowPurchase[client] = true;
         FakeClientCommand(client, "buy %s", szFallback);
         CreateTimer(0.05, Timer_ResetPurchaseFlag, GetClientUserId(client));
-        
-        PrintToServer("[Bot Purchase] Client %d downgraded: %s -> %s ($%d)", 
-            client, szItem, szFallback, GetItemPrice(szFallback));
-    }
-    else
-    {
-        PrintToServer("[Bot Purchase] Client %d cannot afford %s ($%d) and no fallback available", 
-            client, szItem, iPrice);
     }
     
     return Plugin_Stop;
@@ -3525,7 +3271,7 @@ public Action Command_ShowStatus(int client, int args)
     ReplyToCommand(client, "  Economy Mode: %s", szEconomyMode);
     ReplyToCommand(client, "  Current Round: %d", g_iCurrentRound);
     ReplyToCommand(client, "  Rec Folder: %s", g_bRecFolderSelected ? g_szCurrentRecFolder : "None");
-    
+
     int iPlayingCount = 0;
     for (int i = 1; i <= MaxClients; i++)
     {
@@ -3638,12 +3384,6 @@ int GetAliveTeamCount(int iTeam)
     return iNumber;
 }
 
-/**
- * 获取武器所属槽位
- * 
- * @param szItem    物品名称（不含weapon_前缀）
- * @return          槽位索引（CS_SLOT_PRIMARY/SECONDARY），-1表示不是武器
- */
 int GetWeaponSlotFromItem(const char[] szItem)
 {
     // 主武器
@@ -3865,16 +3605,16 @@ public Action Command_SelectDemo(int client, int args)
     // 加载freeze时间
     if (LoadFreezeTimes(szMap, g_szCurrentRecFolder))
     {
-        ReplyToCommand(client, "[Bot REC] ✓ Loaded freeze times for '%s'", szDemoFolder);
+        ReplyToCommand(client, "[Bot REC] Loaded freeze times for '%s'", szDemoFolder);
     }
     
     // 加载购买数据
     if (LoadPurchaseDataFile(g_szCurrentRecFolder))
     {
-        ReplyToCommand(client, "[Bot REC] ✓ Loaded purchase data for '%s'", szDemoFolder);
+        ReplyToCommand(client, "[Bot REC] Loaded purchase data for '%s'", szDemoFolder);
     }
     
-    ReplyToCommand(client, "[Bot REC] ✓ Demo folder set to: %s", szDemoFolder);
+    ReplyToCommand(client, "[Bot REC] Demo folder set to: %s", szDemoFolder);
     ReplyToCommand(client, "[Bot REC] Use 'mp_restartgame 1' to apply changes");
     
     return Plugin_Handled;
@@ -3920,7 +3660,7 @@ KnapsackResult SolveKnapsackDP(ArrayList hBots, ArrayList hRecInfoList, int iTot
         
         for (int b = 0; b < iBudgetSize; b++)
         {
-            dpRow.Push(0);  // 全部初始化为0
+            dpRow.Push(0);
             choiceRow.Push(-1);
             
             ArrayList usedRecs = new ArrayList();
@@ -3980,7 +3720,6 @@ KnapsackResult SolveKnapsackDP(ArrayList hBots, ArrayList hRecInfoList, int iTot
                     ArrayList prevUsedList = view_as<ArrayList>(prevUsedRecs.Get(prevBudgetIndex));
                     bool bRecAlreadyUsed = (prevUsedList.FindValue(r) != -1);
                     
-                    // 移除 prevValue >= 0 检查 
                     if (!bRecAlreadyUsed)
                     {
                         int newValue = prevValue + value;
@@ -3996,12 +3735,10 @@ KnapsackResult SolveKnapsackDP(ArrayList hBots, ArrayList hRecInfoList, int iTot
                             delete newUsedList;
                             
                             newUsedList = new ArrayList();
-                            // 复制前一个状态的已使用列表
                             for (int u = 0; u < prevUsedList.Length; u++)
                             {
                                 newUsedList.Push(prevUsedList.Get(u));
                             }
-                            // 添加当前REC
                             newUsedList.Push(r);
                             
                             currentUsedRecs.Set(b, newUsedList);
@@ -4065,10 +3802,6 @@ KnapsackResult SolveKnapsackDP(ArrayList hBots, ArrayList hRecInfoList, int iTot
         
         if (recIndex >= 0)
         {
-            if (usedRecIndices.FindValue(recIndex) != -1)
-            {
-                // 检测到重复,但继续(后续会处理)
-            }
             usedRecIndices.Push(recIndex);
             
             RecEquipmentInfo recInfo;
@@ -4117,7 +3850,6 @@ KnapsackResult LocalSearchOptimize(KnapsackResult initial, ArrayList hBots,
                                    ArrayList hRecInfoList, int iTotalBudget)
 {
     KnapsackResult current;
-    // 复制initial到current
     current.isValid = initial.isValid;
     current.totalValue = initial.totalValue;
     current.totalCost = initial.totalCost;
@@ -4144,7 +3876,6 @@ KnapsackResult LocalSearchOptimize(KnapsackResult initial, ArrayList hBots,
             for (int j = i + 1; j < iBotCount; j++)
             {
                 KnapsackResult candidate;
-                // 复制current到candidate
                 candidate.isValid = current.isValid;
                 candidate.totalValue = current.totalValue;
                 candidate.totalCost = current.totalCost;
@@ -4168,12 +3899,10 @@ KnapsackResult LocalSearchOptimize(KnapsackResult initial, ArrayList hBots,
                 
                 if (candidateQuality > currentQuality)
                 {
-                    // 验证唯一性
                     if (!ValidateAssignmentUniqueness(candidate, iBotCount))
                     {
                         continue;
                     }
-                    // 复制candidate到current
                     current.isValid = candidate.isValid;
                     current.totalValue = candidate.totalValue;
                     current.totalCost = candidate.totalCost;
@@ -4196,7 +3925,6 @@ KnapsackResult LocalSearchOptimize(KnapsackResult initial, ArrayList hBots,
                 if (r == originalRec)
                     continue;
                 
-                // 检查这个REC是否已经被其他bot使用
                 bool bRecInUse = false;
                 for (int b = 0; b < iBotCount; b++)
                 {
@@ -4208,7 +3936,7 @@ KnapsackResult LocalSearchOptimize(KnapsackResult initial, ArrayList hBots,
                 }
                 
                 if (bRecInUse)
-                    continue;  // 跳过已使用的REC
+                    continue;
                 
                 KnapsackResult candidate;
                 candidate.isValid = current.isValid;
@@ -4231,7 +3959,6 @@ KnapsackResult LocalSearchOptimize(KnapsackResult initial, ArrayList hBots,
                 
                 if (candidateQuality > currentQuality)
                 {
-                    // 双重验证唯一性
                     if (!ValidateAssignmentUniqueness(candidate, iBotCount))
                     {
                         continue;
@@ -4260,7 +3987,7 @@ KnapsackResult LocalSearchOptimize(KnapsackResult initial, ArrayList hBots,
 int EvaluateAssignmentQuality(KnapsackResult result, ArrayList hBots, 
                               ArrayList hRecInfoList)
 {
-    int quality = result.totalValue;  // 基础分：装备总价值
+    int quality = result.totalValue;
     
     int iBotCount = hBots.Length;
     
@@ -4284,7 +4011,6 @@ int EvaluateAssignmentQuality(KnapsackResult result, ArrayList hBots,
         }
     }
     
-    // 计算方差
     float avgValue = float(totalValue) / float(iBotCount);
     float variance = 0.0;
     
@@ -4295,11 +4021,10 @@ int EvaluateAssignmentQuality(KnapsackResult result, ArrayList hBots,
     }
     variance /= float(iBotCount);
     
-    // 方差越大扣分越多
     int variancePenalty = RoundFloat(variance / 100.0);
     quality -= variancePenalty;
     
-    // 软约束2：奖励武器多样性 
+// 软约束2：奖励武器多样性 
     int primaryCount[10];  // 统计各类主武器数量
     for (int i = 0; i < 10; i++)
         primaryCount[i] = 0;
@@ -4765,19 +4490,9 @@ void SimulateDropSystem(ArrayList hBots, KnapsackResult result, ArrayList hRecIn
                     // 更新数组
                     botInfos.SetArray(j, richInfo, sizeof(BotEconomyInfo));
                     
-                    char szFromName[MAX_NAME_LENGTH], szToName[MAX_NAME_LENGTH];
-                    GetClientName(richInfo.client, szFromName, sizeof(szFromName));
-                    GetClientName(info.client, szToName, sizeof(szToName));
-                    
                     if (deficit <= 0)
                         break;
                 }
-            }
-            
-            if (deficit > 0)
-            {
-                char szName[MAX_NAME_LENGTH];
-                GetClientName(info.client, szName, sizeof(szName));
             }
         }
     }
@@ -4837,29 +4552,21 @@ bool ValidateAssignmentUniqueness(KnapsackResult result, int iBotCount)
  */
 void ScheduleDynamicPause(int iRound)
 {
-    PrintToServer("[Pause System] ===== ScheduleDynamicPause CALLED =====");
-    PrintToServer("[Pause System] Game round: %d (0-based)", iRound);
-    PrintToServer("[Pause System] Demo round number: round%d", iRound + 1);
-    PrintToServer("[Pause System] RecFolder: %s", g_bRecFolderSelected ? g_szCurrentRecFolder : "NONE");
-    
     // 检查 bot_pause 插件是否加载
     if (!g_bPausePluginLoaded)
     {
-        PrintToServer("[Pause System] ✗ bot_pause plugin not loaded, pause disabled");
         return;
     }
     
     // 检查回合是否有效
     if (iRound < 0 || iRound >= 31)
     {
-        PrintToServer("[Pause System] ✗ Invalid round: %d (must be 0-30)", iRound);
         return;
     }
     
     // 检查该回合的冻结时间是否有效
     if (!g_bAllRoundFreezeTimeValid[iRound])
     {
-        PrintToServer("[Pause System] ✗ Round %d has no valid freeze time", iRound);
         return;
     }
     
@@ -4870,24 +4577,18 @@ void ScheduleDynamicPause(int iRound)
     if (cvFreezeTime != null)
     {
         fServerFreeze = cvFreezeTime.FloatValue;
-        PrintToServer("[Pause System] ✓ Server freeze time: %.2f seconds", fServerFreeze);
     }
     
     float fDemoFreeze = g_fAllRoundFreezeTimes[iRound];
     
-    PrintToServer("[Pause System] ===== ANALYZING ROUND %d =====", iRound);
-    PrintToServer("[Pause System] Server freeze: %.2f, Demo freeze: %.2f", fServerFreeze, fDemoFreeze);
-    
     // 如果demo冻结时间 <= 服务器冻结时间,不需要暂停
     if (fDemoFreeze <= fServerFreeze)
     {
-        PrintToServer("[Pause System] ✓ No pause needed (demo <= server)");
         return;
     }
     
     // 计算时间差
     float fTimeDiff = fDemoFreeze - fServerFreeze;
-    PrintToServer("[Pause System] ⚠ Pause required! Time difference: %.2f seconds", fTimeDiff);
     
     // 决定暂停策略
     float fPauseDelay = 0.0;
@@ -4900,24 +4601,21 @@ void ScheduleDynamicPause(int iRound)
         // 立即长暂停
         fPauseDelay = 0.0;
         iPauseTime = RoundToNearest(fTimeDiff);
-        PrintToServer("[Pause System] Strategy: IMMEDIATE LONG PAUSE (%d seconds)", iPauseTime);
     }
     else if (fTimeDiff <= 30.0)
     {
         // 立即短暂停
         fPauseDelay = 0.0;
         iPauseTime = RoundToNearest(fTimeDiff);
-        PrintToServer("[Pause System] Strategy: IMMEDIATE SHORT PAUSE (%d seconds)", iPauseTime);
     }
     else
     {
         // 延迟后暂停30秒
         fPauseDelay = fTimeDiff - 30.0;
         iPauseTime = 30;
-        PrintToServer("[Pause System] Strategy: DELAYED 30s PAUSE (delay: %.2f)", fPauseDelay);
     }
     
-// 随机选择一个队伍的bot来执行暂停
+    // 随机选择一个队伍的bot来执行暂停
     int iBotToUse = -1;
     int iTeamToUse = -1;
     
@@ -4925,29 +4623,22 @@ void ScheduleDynamicPause(int iRound)
     int iPausesLeftT = BotPause_GetTeamPausesLeft(CS_TEAM_T);
     int iPausesLeftCT = BotPause_GetTeamPausesLeft(CS_TEAM_CT);
     
-    PrintToServer("[Pause System] Pause availability: T=%d, CT=%d", iPausesLeftT, iPausesLeftCT);
-    
     // 随机选择队伍（优先有暂停次数的队伍）
     if (iPausesLeftT > 0 && iPausesLeftCT > 0)
     {
         // 两队都有暂停次数，随机选择
         iTeamToUse = GetRandomInt(0, 1) == 0 ? CS_TEAM_T : CS_TEAM_CT;
-        PrintToServer("[Pause System] Both teams available, randomly selected: %s", 
-            iTeamToUse == CS_TEAM_T ? "T" : "CT");
     }
     else if (iPausesLeftT > 0)
     {
         iTeamToUse = CS_TEAM_T;
-        PrintToServer("[Pause System] Only T team has pauses left");
     }
     else if (iPausesLeftCT > 0)
     {
         iTeamToUse = CS_TEAM_CT;
-        PrintToServer("[Pause System] Only CT team has pauses left");
     }
     else
     {
-        PrintToServer("[Pause System] ✗ No team has pauses left");
         return;
     }
     
@@ -4966,9 +4657,6 @@ void ScheduleDynamicPause(int iRound)
     
     if (iBotToUse == -1)
     {
-        PrintToServer("[Pause System] ✗ No bot available in team %s, trying other team", 
-            iTeamToUse == CS_TEAM_T ? "T" : "CT");
-        
         // 尝试另一个队伍
         int iOtherTeam = (iTeamToUse == CS_TEAM_T) ? CS_TEAM_CT : CS_TEAM_T;
         int iOtherPauses = BotPause_GetTeamPausesLeft(iOtherTeam);
@@ -4985,22 +4673,15 @@ void ScheduleDynamicPause(int iRound)
                 
                 iBotToUse = i;
                 iTeamToUse = iOtherTeam;
-                PrintToServer("[Pause System] Found bot in other team: %s", 
-                    iTeamToUse == CS_TEAM_T ? "T" : "CT");
                 break;
             }
         }
         
         if (iBotToUse == -1)
         {
-            PrintToServer("[Pause System] ✗ No bot available in any team");
             return;
         }
     }
-    
-    char szBotName[MAX_NAME_LENGTH];
-    GetClientName(iBotToUse, szBotName, sizeof(szBotName));
-    PrintToServer("[Pause System] Using bot: %s (client %d)", szBotName, iBotToUse);
     
     // 创建定时器让bot执行暂停
     DataPack pack = new DataPack();
@@ -5008,9 +4689,6 @@ void ScheduleDynamicPause(int iRound)
     pack.WriteCell(iPauseTime);
     
     CreateTimer(fPauseDelay, Timer_BotExecutePause, pack, TIMER_FLAG_NO_MAPCHANGE);
-    
-    PrintToServer("[Pause System] ✓ Pause scheduled: delay=%.2f, duration=%d", fPauseDelay, iPauseTime);
-    PrintToServer("[Pause System] ===== PAUSE SYSTEM ACTIVE =====");
 }
 
 /**
@@ -5029,13 +4707,6 @@ public Action Timer_BotExecutePause(Handle hTimer, DataPack pack)
     {
         return Plugin_Stop;
     }
-    
-    char szBotName[MAX_NAME_LENGTH];
-    GetClientName(client, szBotName, sizeof(szBotName));
-    
-    PrintToServer("[Pause System] ===== BOT EXECUTING PAUSE =====");
-    PrintToServer("[Pause System] Bot: %s (client %d)", szBotName, client);
-    PrintToServer("[Pause System] Pause time: %d seconds", iPauseTime);
     
     // 让bot发送暂停命令（如果是默认时间则不带参数）
     if (iPauseTime == 30)  // DEFAULT_PAUSE_TIME
@@ -5115,7 +4786,7 @@ void InitWeaponData()
     g_hWeaponConversion_T.SetString("scar20", "g3sg1");
     g_hWeaponConversion_T.SetString("mag7", "sawedoff");
     g_hWeaponConversion_T.SetString("incgrenade", "molotov");
-    
+
     // CT阵营武器转换
     g_hWeaponConversion_CT.SetString("ak47", "m4a1");
     g_hWeaponConversion_CT.SetString("galilar", "famas");
@@ -5314,7 +4985,6 @@ stock bool BotShared_Init()
         g_BotShared_State[i] = BotState_Normal;
     }
     
-    PrintToServer("[Bot Shared] Initialized successfully");
     return true;
 }
 
@@ -5429,7 +5099,6 @@ bool LoadC4HolderDataFile(const char[] szRecFolder)
     
     if (!FileExists(szPath))
     {
-        PrintToServer("[C4 Holder] File not found: %s", szPath);
         return false;
     }
     
@@ -5441,12 +5110,9 @@ bool LoadC4HolderDataFile(const char[] szRecFolder)
     g_jC4HolderData = view_as<JSONArray>(JSONArray.FromFile(szPath));
     if (g_jC4HolderData == null)
     {
-        PrintToServer("[C4 Holder] Failed to parse JSON");
         return false;
     }
     
-    PrintToServer("[C4 Holder] Loaded C4 holder data from: %s (entries: %d)", 
-        szPath, g_jC4HolderData.Length);
     return true;
 }
 
@@ -5472,7 +5138,6 @@ bool GetC4HolderForRound(int iRound, char[] szPlayerName, int iMaxLen)
             jEntry.GetString("player_name", szPlayerName, iMaxLen);
             delete jEntry;
             
-            PrintToServer("[C4 Holder] Round %d holder: %s", iTargetRound, szPlayerName);
             return true;
         }
         
@@ -5491,15 +5156,10 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
     
     if (!GetC4HolderForRound(g_iCurrentRound, szHolderName, sizeof(szHolderName)))
     {
-        PrintToServer("[C4 Holder] No C4 holder defined for round %d", g_iCurrentRound + 1);
         return Plugin_Stop;
     }
     
-    PrintToServer("[C4 Holder] ===== FREEZE START C4 ASSIGNMENT =====");
-    PrintToServer("[C4 Holder] Target holder: %s (Round %d)", szHolderName, g_iCurrentRound + 1);
-    
     // 首先检查C4是否在真人玩家手上
-    int iCurrentHolder = -1;
     bool bIsOnRealPlayer = false;
     
     for (int i = 1; i <= MaxClients; i++)
@@ -5518,13 +5178,7 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
             
             if (StrEqual(szClass, "weapon_c4", false))
             {
-                iCurrentHolder = i;
                 bIsOnRealPlayer = !IsFakeClient(i);
-                
-                char szCurrentName[MAX_NAME_LENGTH];
-                GetClientName(i, szCurrentName, sizeof(szCurrentName));
-                PrintToServer("[C4 Holder] Current holder: %s (client %d, bot=%d)", 
-                    szCurrentName, i, IsFakeClient(i) ? 1 : 0);
                 break;
             }
         }
@@ -5533,8 +5187,6 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
     // 如果C4在玩家手上，不进行转移
     if (bIsOnRealPlayer)
     {
-        char szPlayerName[MAX_NAME_LENGTH];
-        GetClientName(iCurrentHolder, szPlayerName, sizeof(szPlayerName));
         return Plugin_Stop;
     }
     
@@ -5562,13 +5214,8 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
     
     if (iTargetBot == -1)
     {
-        PrintToServer("[C4 Holder] ✗ Target bot '%s' not found", szHolderName);
         return Plugin_Stop;
     }
-    
-    char szTargetName[MAX_NAME_LENGTH];
-    GetClientName(iTargetBot, szTargetName, sizeof(szTargetName));
-    PrintToServer("[C4 Holder] Found target: %s (client %d)", szTargetName, iTargetBot);
     
     // 检查目标bot是否已有C4
     int iTargetC4 = GetPlayerWeaponSlot(iTargetBot, CS_SLOT_C4);
@@ -5578,7 +5225,6 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
     }
     
     // 移除所有其他T方bot的C4（不包括真人玩家）
-    int iRemovedCount = 0;
     for (int i = 1; i <= MaxClients; i++)
     {
         if (!IsValidClient(i) || !IsPlayerAlive(i) || i == iTargetBot)
@@ -5601,29 +5247,13 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
             {
                 RemovePlayerItem(i, iC4);
                 AcceptEntityInput(iC4, "Kill");
-                
-                char szBotName[MAX_NAME_LENGTH];
-                GetClientName(i, szBotName, sizeof(szBotName));
-                PrintToServer("[C4 Holder]   Removed C4 from %s", szBotName);
-                iRemovedCount++;
             }
         }
     }
     
     // 给目标bot分配C4
-    int iNewC4 = GivePlayerItem(iTargetBot, "weapon_c4");
+    GivePlayerItem(iTargetBot, "weapon_c4");
     
-    if (IsValidEntity(iNewC4))
-    {
-        PrintToServer("[C4 Holder] ✓ Successfully gave C4 to %s", szTargetName);
-        PrintToServer("[C4 Holder]   Removed: %d, Assigned: 1", iRemovedCount);
-    }
-    else
-    {
-        PrintToServer("[C4 Holder] ✗ Failed to give C4 to %s", szTargetName);
-    }
-    
-    PrintToServer("[C4 Holder] ===== ASSIGNMENT COMPLETE =====");
     return Plugin_Stop;
 }
 
@@ -5632,7 +5262,6 @@ public void OnLibraryAdded(const char[] name)
     if (StrEqual(name, "bot_pause"))
     {
         g_bPausePluginLoaded = true;
-        PrintToServer("[Bot REC] bot_pause plugin detected");
     }
 }
 
@@ -5641,6 +5270,5 @@ public void OnLibraryRemoved(const char[] name)
     if (StrEqual(name, "bot_pause"))
     {
         g_bPausePluginLoaded = false;
-        PrintToServer("[Bot REC] bot_pause plugin unloaded");
     }
-}
+}    
