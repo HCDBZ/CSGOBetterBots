@@ -9,14 +9,18 @@ public Plugin myinfo =
     name = "Bot Voice",
     author = "Tasty cup",
     description = "Makes bots play voice audio",
-    version = "1.0.0",
+    version = "1.0.1",
     url = ""
 };
 
-// 全局变量
-bool g_bIsSpeaking[MAXPLAYERS+1];
-Handle g_hVoiceTimer[MAXPLAYERS+1];
-char g_szCurrentVoiceFile[MAXPLAYERS+1][PLATFORM_MAX_PATH];
+// 语音任务数据结构
+enum struct VoiceTask
+{
+    char filePath[PLATFORM_MAX_PATH];
+    Handle timer;
+}
+
+ArrayList g_aVoiceTasks[MAXPLAYERS+1];
 
 // 前向声明
 Handle g_hOnBotStartSpeaking = null;
@@ -39,52 +43,46 @@ public void OnPluginStart()
 {
     for (int i = 1; i <= MaxClients; i++)
     {
+        g_aVoiceTasks[i] = new ArrayList(sizeof(VoiceTask));
+        
         if (IsClientInGame(i))
         {
             OnClientPutInServer(i);
         }
     }
     
-    PrintToServer("[Bot Voice] Plugin loaded - Audio only mode");
+    PrintToServer("[Bot Voice] Plugin loaded - Multi-voice support");
 }
 
 public void OnClientPutInServer(int client)
 {
-    g_bIsSpeaking[client] = false;
-    g_hVoiceTimer[client] = null;
-    g_szCurrentVoiceFile[client][0] = '\0';
+    if (g_aVoiceTasks[client] == null)
+        g_aVoiceTasks[client] = new ArrayList(sizeof(VoiceTask));
+    else
+        g_aVoiceTasks[client].Clear();
 }
 
 public void OnClientDisconnect(int client)
 {
-    StopSpeaking(client);
+    ClearAllVoiceTasks(client);
 }
 
 void StartSpeaking(int client, const char[] voiceFile, float duration)
 {
     if (!IsValidClient(client))
         return;
+
+    VoiceTask task;
+    strcopy(task.filePath, PLATFORM_MAX_PATH, voiceFile);
     
-    if (g_bIsSpeaking[client])
-    {
-        StopSpeaking(client);
-    }
-    
-    g_bIsSpeaking[client] = true;
-    strcopy(g_szCurrentVoiceFile[client], PLATFORM_MAX_PATH, voiceFile);
-    
-    // 播放语音
     PlayVoiceToAll(client, voiceFile);
-    
-    // 自动停止定时器
-    if (g_hVoiceTimer[client] != null)
-    {
-        KillTimer(g_hVoiceTimer[client]);
-    }
     
     DataPack pack = new DataPack();
     pack.WriteCell(GetClientUserId(client));
-    g_hVoiceTimer[client] = CreateTimer(duration, Timer_AutoStopSpeaking, pack);
+    pack.WriteString(voiceFile);
+    
+    task.timer = CreateTimer(duration, Timer_AutoStopSpeaking, pack);
+    g_aVoiceTasks[client].PushArray(task);
     
     Call_StartForward(g_hOnBotStartSpeaking);
     Call_PushCell(client);
@@ -96,28 +94,45 @@ void StopSpeaking(int client)
     if (!IsValidClient(client))
         return;
     
-    if (!g_bIsSpeaking[client])
+    if (g_aVoiceTasks[client].Length == 0)
         return;
     
-    g_bIsSpeaking[client] = false;
+    VoiceTask task;
+    g_aVoiceTasks[client].GetArray(0, task);
     
-    // 停止语音
-    if (g_szCurrentVoiceFile[client][0] != '\0')
+    StopVoiceSound(task.filePath);
+    
+    if (task.timer != null)
     {
-        StopVoiceSound(g_szCurrentVoiceFile[client]);
-        g_szCurrentVoiceFile[client][0] = '\0';
+        KillTimer(task.timer);
     }
     
-    // 清理定时器
-    if (g_hVoiceTimer[client] != null)
-    {
-        KillTimer(g_hVoiceTimer[client]);
-        g_hVoiceTimer[client] = null;
-    }
+    g_aVoiceTasks[client].Erase(0);
     
     Call_StartForward(g_hOnBotStopSpeaking);
     Call_PushCell(client);
     Call_Finish();
+}
+
+void ClearAllVoiceTasks(int client)
+{
+    if (!IsValidClient(client))
+        return;
+    
+    VoiceTask task;
+    for (int i = 0; i < g_aVoiceTasks[client].Length; i++)
+    {
+        g_aVoiceTasks[client].GetArray(i, task);
+        
+        StopVoiceSound(task.filePath);
+        
+        if (task.timer != null)
+        {
+            KillTimer(task.timer);
+        }
+    }
+    
+    g_aVoiceTasks[client].Clear();
 }
 
 void PlayVoiceToAll(int client, const char[] voiceFile)
@@ -152,13 +167,26 @@ public Action Timer_AutoStopSpeaking(Handle timer, DataPack pack)
 {
     pack.Reset();
     int userId = pack.ReadCell();
+    char voiceFile[PLATFORM_MAX_PATH];
+    pack.ReadString(voiceFile, sizeof(voiceFile));
     delete pack;
     
     int client = GetClientOfUserId(userId);
-    if (client > 0)
+    if (client > 0 && IsValidClient(client))
     {
-        g_hVoiceTimer[client] = null;
-        StopSpeaking(client);
+        StopVoiceSound(voiceFile);
+        
+        VoiceTask task;
+        for (int i = 0; i < g_aVoiceTasks[client].Length; i++)
+        {
+            g_aVoiceTasks[client].GetArray(i, task);
+            
+            if (StrEqual(task.filePath, voiceFile))
+            {
+                g_aVoiceTasks[client].Erase(i);
+                break;
+            }
+        }
     }
     
     return Plugin_Stop;
@@ -187,7 +215,7 @@ public int Native_StopSpeaking(Handle plugin, int numParams)
 public int Native_IsSpeaking(Handle plugin, int numParams)
 {
     int client = GetNativeCell(1);
-    return g_bIsSpeaking[client];
+    return g_aVoiceTasks[client].Length > 0;
 }
 
 bool IsValidClient(int client)

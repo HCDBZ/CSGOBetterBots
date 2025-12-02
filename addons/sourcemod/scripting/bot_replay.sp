@@ -18,7 +18,7 @@ public Plugin myinfo =
 	name = "Bot Replay", 
 	author = "Tasty cup", 
 	description = "Play recordings for bots at round start", 
-	version = "1.1.0", 
+	version = "1.1.1", 
 	url = ""
 };
 
@@ -644,14 +644,36 @@ public void BotMimic_OnPlayerStopsMimicing(int client, char[] name, char[] categ
 
         g_bPlayingRoundStartRec[client] = false;
 
-        // 停止语音
-        if (BotVoice_IsSpeaking(client))
+        // 不再停止语音,让语音继续播放
+        KillClientTimer(g_hPurchaseTimer[client]);
+        
+        if (g_hPurchaseActions[client] != null)
         {
-            BotVoice_StopSpeaking(client);
+            delete g_hPurchaseActions[client];
+            g_hPurchaseActions[client] = null;
+        }
+        g_iPurchaseActionIndex[client] = 0;
+        
+        KillClientTimer(g_hChatTimer[client]);
+        
+        if (g_hChatActions[client] != null)
+        {
+            delete g_hChatActions[client];
+            g_hChatActions[client] = null;
+        }
+        g_iChatActionIndex[client] = 0;
+        
+        // 不清理语音timer,让其继续运行
+        
+        g_bAllowPurchase[client] = false;
+
+        if (g_hInitialInventory[client] != null)
+        {
+            delete g_hInitialInventory[client];
+            g_hInitialInventory[client] = null;
         }
         
-        // 使用公共函数清理所有timer
-        CleanupClientTimers(client);
+        g_bInitialInventoryApplied[client] = false;
         
         // Unhook伤害
         SDKUnhook(client, SDKHook_OnTakeDamage, OnTakeDamage);
@@ -4674,7 +4696,7 @@ public Action Timer_ExecuteVoiceAction(Handle hTimer, DataPack pack)
         return Plugin_Stop;
     }
     
-    if (IsInWarmup() || !g_bPlayingRoundStartRec[client] || g_hVoiceActions[client] == null)
+    if (IsInWarmup() || g_hVoiceActions[client] == null)
     {
         g_hVoiceTimer[client] = null;
         delete pack;
