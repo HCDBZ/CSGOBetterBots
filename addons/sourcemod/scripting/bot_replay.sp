@@ -18,7 +18,7 @@ public Plugin myinfo =
 	name = "Bot Replay", 
 	author = "Tasty cup", 
 	description = "Play recordings for bots at round start", 
-	version = "1.1.1", 
+	version = "1.1.2", 
 	url = ""
 };
 
@@ -643,16 +643,6 @@ public void BotMimic_OnPlayerStopsMimicing(int client, char[] name, char[] categ
         BotShared_ResetBotState(client);
 
         g_bPlayingRoundStartRec[client] = false;
-
-        // 不再停止语音,让语音继续播放
-        KillClientTimer(g_hPurchaseTimer[client]);
-        
-        if (g_hPurchaseActions[client] != null)
-        {
-            delete g_hPurchaseActions[client];
-            g_hPurchaseActions[client] = null;
-        }
-        g_iPurchaseActionIndex[client] = 0;
         
         KillClientTimer(g_hChatTimer[client]);
         
@@ -662,8 +652,6 @@ public void BotMimic_OnPlayerStopsMimicing(int client, char[] name, char[] categ
             g_hChatActions[client] = null;
         }
         g_iChatActionIndex[client] = 0;
-        
-        // 不清理语音timer,让其继续运行
         
         g_bAllowPurchase[client] = false;
 
@@ -3289,10 +3277,10 @@ void CleanupClientTimers(int client)
 
     KillClientTimer(g_hVoiceTimer[client]);
     
-    // 停止语音
+    // 停止所有正在播放的语音
     if (BotVoice_IsSpeaking(client))
     {
-        BotVoice_StopSpeaking(client);
+        BotVoice_StopAllSpeaking(client);  
     }
     
     if (g_hVoiceActions[client] != null)
@@ -4704,24 +4692,18 @@ public Action Timer_ExecuteVoiceAction(Handle hTimer, DataPack pack)
     }
     
     float fCurrentTime = GetGameTime() - g_fRecStartTime[client];
-    bool bClientAlive = IsPlayerAlive(client);  // 获取bot当前存活状态
+    bool bClientAlive = IsPlayerAlive(client);
     
     while (g_iVoiceActionIndex[client] < g_hVoiceActions[client].Length)
     {
         VoiceActionEntry entry;
         g_hVoiceActions[client].GetArray(g_iVoiceActionIndex[client], entry, sizeof(VoiceActionEntry));
         
-        if (fCurrentTime < entry.startTime) break;
+        if (fCurrentTime < entry.startTime) 
+            break;
         
         // 检查存活状态是否匹配
         if (entry.isAlive != bClientAlive)
-        {
-            g_iVoiceActionIndex[client]++;
-            continue;  // 状态不匹配，跳过这条语音
-        }
-        
-        // 检查是否正在说话
-        if (BotVoice_IsSpeaking(client))
         {
             g_iVoiceActionIndex[client]++;
             continue;
@@ -4735,9 +4717,9 @@ public Action Timer_ExecuteVoiceAction(Handle hTimer, DataPack pack)
         BotVoice_StartSpeaking(client, szVoiceFile, entry.duration);
         
         g_iVoiceActionIndex[client]++;
-        break;
     }
     
+    // 如果所有语音都播放完毕,停止定时器
     if (g_iVoiceActionIndex[client] >= g_hVoiceActions[client].Length)
     {
         g_hVoiceTimer[client] = null;
