@@ -36,6 +36,7 @@
 #define ADDITIONAL_FIELD_TELEPORTED_ORIGIN (1<<0)
 #define ADDITIONAL_FIELD_TELEPORTED_ANGLES (1<<1)
 #define ADDITIONAL_FIELD_TELEPORTED_VELOCITY (1<<2)
+#define IN_DROP (1 << 26)
 
 enum struct FrameInfo {
     int playerButtons;
@@ -371,6 +372,9 @@ public void OnClientDisconnect(int client)
 
 public void OnPlayerRunCmdPost(int client, int buttons, int impulse, const float vel[3], const float angles[3], int weapon, int subtype, int cmdnum, int tickcount, int seed, const int mouse[2])
 {
+	if(!IsValidClient(client))
+		return;
+	
 	// Client isn't recording or recording is paused.
 	if(g_hRecording[client] == null || g_bRecordingPaused[client])
 		return;
@@ -630,6 +634,26 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
 	{
 		g_bBotSwitchedWeapon[client] = false;
 		SDKCall(g_hSwitchWeaponCall, client, g_iBotActiveWeapon[client], 0);
+	}
+	
+	if(buttons & IN_DROP)
+	{
+		int dropSlotEncoded = (buttons >> 27) & 0x1F;
+	
+		if(dropSlotEncoded == 0)
+		{
+			FakeClientCommand(client, "drop");
+		}
+		else
+		{
+			int dropSlot = dropSlotEncoded - 1;
+			int weaponToDrop = GetPlayerWeaponSlot(client, dropSlot);
+		
+			if(weaponToDrop != INVALID_ENT_REFERENCE && IsValidEntity(weaponToDrop))
+			{
+				CS_DropWeapon(client, weaponToDrop, true, true);
+			}
+		}
 	}
 	
 	// See if there's a bookmark on this tick
@@ -1892,7 +1916,7 @@ BMError PlayRecord(int client, const char[] path)
 	g_hBotMimicsRecord[client] = iFileHeader.FH_frames;
 	g_iBotMimicTick[client] = 0;
 	g_iBotMimicRecordTickCount[client] = iFileHeader.FH_tickCount;
-	g_iCurrentAdditionalTeleportIndex[client] = 0;
+	g_iCurrentAdditionalTeleportIndex[client] = 0; 
 	g_iBotActiveWeapon[client] = INVALID_ENT_REFERENCE;
 	g_bBotSwitchedWeapon[client] = false;
 	
@@ -1922,6 +1946,7 @@ BMError PlayRecord(int client, const char[] path)
 	{
 		g_hBotMimicsRecord[client] = null;
 		g_iBotMimicRecordTickCount[client] = 0;
+		g_iCurrentAdditionalTeleportIndex[client] = 0;  
 		g_iBotMimicNextBookmarkTick[client].BWM_frame = -1;
 		g_iBotMimicNextBookmarkTick[client].BWM_index = -1;
 	}

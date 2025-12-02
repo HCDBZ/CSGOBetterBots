@@ -5,6 +5,7 @@
 #include <botmimic>
 #include <ripext>
 #include <bot_pause>
+#include <bot_voice>
 
 #pragma newdecls required
 #pragma semicolon 1
@@ -14,10 +15,10 @@
 // ============================================================================
 public Plugin myinfo = 
 {
-	name = "Bot Round Start REC Player", 
+	name = "Bot Replay", 
 	author = "Tasty cup", 
 	description = "Play recordings for bots at round start", 
-	version = "1.0.1", 
+	version = "1.1.0", 
 	url = ""
 };
 
@@ -52,17 +53,12 @@ enum EconomySelectionMode
     Economy_BothTeams = 1      // 双队经济模式
 }
 
-// 混合算法核心数据结构
-// Bot经济信息
-enum struct BotEconomyInfo
+// 经济需求类型
+enum EconomyDemandType
 {
-    int client;              // Bot客户端索引
-    int money;               // 当前金钱
-    int teamIndex;           // 在队伍中的索引(0-4)
-    int assignedRecIndex;    // 分配的REC索引
-    int assignedCost;        // 分配的REC成本
-    int assignedValue;       // 分配的REC价值
-    char assignedRecName[PLATFORM_MAX_PATH];  // 分配的REC名称
+    Demand_Eco = 0,      // eco局
+    Demand_SemiForce,    // 半起
+    Demand_FullForce     // 强起
 }
 
 // REC装备信息
@@ -71,21 +67,16 @@ enum struct RecEquipmentInfo
     char recName[PLATFORM_MAX_PATH];  // REC文件名
     int totalCost;           // 总成本
     int totalValue;          // 总价值
-    int tacticalValue;       // 战术价值(加权)
-    bool hasPrimary;         // 是否有主武器
-    bool hasSniper;          // 是否有狙击枪
-    bool hasRifle;           // 是否有步枪
-    int utilityCount;        // 道具数量
-    char primaryWeapon[64];  // 主武器名称
 }
 
-// 背包DP结果
-enum struct KnapsackResult
+// 回合候选信息(用于双队经济模式)
+enum struct RoundCandidate
 {
-    int totalValue;          // 总装备价值
-    int totalCost;           // 总花费
-    bool isValid;            // 是否有效
-    int assignment[MAXPLAYERS+1];  // 每个Bot分配的REC索引(-1表示未分配)
+    int round;                          // 回合编号
+    char demoFolder[PLATFORM_MAX_PATH]; // demo文件夹
+    int totalValue;                     // 总价值
+    float freezeTime;                   // 冻结时间
+    int assignment[MAXPLAYERS+1];       // 分配方案
 }
 
 // Bot状态
@@ -133,10 +124,16 @@ int g_BotShared_EnemyOffset = -1;           // 敌人偏移
 int g_BotShared_CachedEnemy[MAXPLAYERS+1] = {-1, ...};        // 缓存的敌人
 float g_BotShared_EnemyCacheTime[MAXPLAYERS+1] = {0.0, ...};  // 缓存时间
 
+// 武器类型常量定义
+#define WEAPON_TYPE_RIFLE 1
+#define WEAPON_TYPE_SNIPER 2
+#define WEAPON_TYPE_SMG 4
+#define WEAPON_TYPE_UTILITY 8
+#define WEAPON_TYPE_DEFAULT_PISTOL 16
+
 // ConVars
 ConVar g_cvEconomyMode;
 ConVar g_cvRoundMode;
-ConVar g_cvEnableDrops;
 
 // 武器数据表 
 StringMap g_hWeaponPrices;
@@ -153,22 +150,34 @@ ArrayList g_hChatActions[MAXPLAYERS+1];           // 每个bot的聊天队列
 int g_iChatActionIndex[MAXPLAYERS+1];             // 当前聊天动作索引
 Handle g_hChatTimer[MAXPLAYERS+1];                // 每个bot的聊天timer
 
+// 语音系统
+JSONArray g_jVoiceData = null;                    // 语音数据
+ArrayList g_hVoiceActions[MAXPLAYERS+1];          // 每个bot的语音队列
+int g_iVoiceActionIndex[MAXPLAYERS+1];            // 当前语音动作索引
+Handle g_hVoiceTimer[MAXPLAYERS+1];               // 每个bot的语音timer
+ArrayList g_hVoiceFiles[MAXPLAYERS+1];            // 存储每个bot的语音文件列表
+
+enum struct VoiceActionEntry
+{
+    float startTime;
+    float duration;
+    int fileIndex; 
+    bool isAlive;
+}
+
 // 购买数据（用于经济模式）
 JSONObject g_jPurchaseData = null;
-// C4持有者数据
-JSONArray g_jC4HolderData = null;
+JSONArray g_jC4HolderData = null;                 // C4持有者数据
+JSONObject g_jMoneyData = null;                   // money.json缓存
 
 // 购买系统
 ArrayList g_hPurchaseActions[MAXPLAYERS+1];       // 每个bot的购买队列
 int g_iPurchaseActionIndex[MAXPLAYERS+1];         // 当前购买动作索引
 Handle g_hPurchaseTimer[MAXPLAYERS+1];            // 每个bot的购买timer
 ArrayList g_hFinalInventory[MAXPLAYERS+1];        // 每个bot应该拥有的最终装备
-bool g_bInventoryVerified[MAXPLAYERS+1];          // 是否已经验证装备
-Handle g_hVerifyTimer[MAXPLAYERS+1];              // 装备验证定时器
+ArrayList g_hInitialInventory[MAXPLAYERS+1];      // 每个bot回合开始的初始装备
+bool g_bInitialInventoryApplied[MAXPLAYERS+1];    // 初始装备是否已应用
 bool g_bAllowPurchase[MAXPLAYERS+1];              // 标记是否允许购买（用于区分系统购买和手动购买）
-ArrayList g_hDropActions[MAXPLAYERS+1];           // 每个bot的丢弃队列
-int g_iDropActionIndex[MAXPLAYERS+1];             // 当前丢弃动作索引
-Handle g_hDropTimer[MAXPLAYERS+1];                // 每个bot的丢弃timer
 
 // 带包检测
 Handle g_hBombCarrierCheckTimer = null;              // 带包检测timer
@@ -203,10 +212,6 @@ public void OnPluginStart()
     g_cvRoundMode = CreateConVar("sm_botrec_round_mode", "0", 
         "Round selection mode: 0=Full Match (default), 1=Economy Based", 
         FCVAR_NOTIFY, true, 0.0, true, 1.0);
-
-    g_cvEnableDrops = CreateConVar("sm_botrec_enable_drops", "1",
-        "Enable/disable weapon drop system: 0=Disabled, 1=Enabled",
-        FCVAR_NOTIFY, true, 0.0, true, 1.0);    
     
     // 注册管理员命令
     RegAdminCmd("sm_botrec_economy", Command_SetEconomyMode, ADMFLAG_GENERIC, 
@@ -239,17 +244,20 @@ public void OnPluginStart()
         g_hPurchaseActions[i] = null;
         g_iPurchaseActionIndex[i] = 0;
         g_hFinalInventory[i] = null;
-        g_bInventoryVerified[i] = false;
-        g_hVerifyTimer[i] = null;
         g_bAllowPurchase[i] = false;
-        g_hDropTimer[i] = null;
-        g_hDropActions[i] = null;
-        g_iDropActionIndex[i] = 0;  
+        g_hInitialInventory[i] = null;
+        g_bInitialInventoryApplied[i] = false;
 
         // 初始化聊天数据 
         g_hChatTimer[i] = null;
         g_hChatActions[i] = null;
-        g_iChatActionIndex[i] = 0;             
+        g_iChatActionIndex[i] = 0;   
+
+        // 初始化语音数据
+        g_hVoiceTimer[i] = null;
+        g_hVoiceActions[i] = null;
+        g_iVoiceActionIndex[i] = 0;     
+        g_hVoiceFiles[i] = null;  
     }
     
     // 重置阵营回合选择
@@ -308,6 +316,13 @@ public void OnMapStart()
         g_jPurchaseData = null;
     }
 
+    // 清理语音数据
+    if (g_jVoiceData != null)
+    {
+        delete g_jVoiceData;
+        g_jVoiceData = null;
+    }
+
     // 清理C4持有者数据
     if (g_jC4HolderData != null)
     {
@@ -325,26 +340,11 @@ public void OnMapStart()
 
 public void OnMapEnd()
 {
-    // 清理购买数据
-    if (g_jPurchaseData != null)
-    {
-        delete g_jPurchaseData;
-        g_jPurchaseData = null;
-    }
+    // 清理所有缓存数据
+    ClearAllCachedData();
     
     // 清理带包检测timer
-    if (g_hBombCarrierCheckTimer != null)
-    {
-        KillTimer(g_hBombCarrierCheckTimer);
-        g_hBombCarrierCheckTimer = null;
-    }
-    
-    // 清理聊天数据
-    if (g_jChatData != null)
-    {
-        delete g_jChatData;
-        g_jChatData = null;
-    }
+    KillClientTimer(g_hBombCarrierCheckTimer);
 }
 
 public void OnClientPostAdminCheck(int client)
@@ -382,15 +382,14 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
-    // 第一回合或中场后选择新的rec文件夹
-    if (g_iCurrentRound == 0 || g_iCurrentRound == 15)
+
+    // 第一回合选择rec文件夹
+    if (g_iCurrentRound == 0)
     {
         if (SelectRandomRecFolder(szMap))
         {
             PrintToServer("[Bot REC] Selected folder: %s", g_szCurrentRecFolder);
-            LoadFreezeTimes(szMap, g_szCurrentRecFolder);
-            LoadPurchaseDataFile(g_szCurrentRecFolder);
-            LoadChatDataFile(g_szCurrentRecFolder);
+            LoadAllDemoData(szMap, g_szCurrentRecFolder); 
         }
         else
         {
@@ -400,7 +399,9 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     }
     else if (g_bRecFolderSelected && !g_bRoundFreezeTimeValid[g_iCurrentRound])
     {
-        LoadFreezeTimes(szMap, g_szCurrentRecFolder);
+        float fDummy[31];
+        bool bDummy[31];
+        LoadFreezeTimes(szMap, g_szCurrentRecFolder, fDummy, bDummy);
     }
     
     // 如果是经济回合模式
@@ -478,7 +479,7 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     // 在冻结时间开始时立即分配C4
     if (g_bRecFolderSelected)
     {
-        // 0.1秒后执行，确保所有bot的REC都已分配完成
+        // 延迟0.1秒
         CreateTimer(0.1, Timer_AssignC4AtFreezeStart, _, TIMER_FLAG_NO_MAPCHANGE);
     }
     
@@ -507,7 +508,7 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
     
     g_iAssignedRecIndex[client] = -1;
     g_bRecMoneySet[client] = false;
-    g_bInventoryVerified[client] = false;  
+    g_bInitialInventoryApplied[client] = false;
 }
 
 // ============================================================================
@@ -568,11 +569,10 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
                     if (g_iRoundMode == Round_FullMatch || 
                         (g_iRoundMode == Round_Economy && g_iEconomyMode == Economy_BothTeams))
                     {
-                        // 增加额外验证
                         // 敌人必须"正在播放且仍在播放中"
                         if (g_bPlayingRoundStartRec[iEnemy] && BotMimic_IsPlayerMimicing(iEnemy))
                         {
-                            bSeeEnemy = false;  // 敌人确实在播放，不停止
+                            bSeeEnemy = false;  
                         }
                         else
                         {
@@ -643,6 +643,12 @@ public void BotMimic_OnPlayerStopsMimicing(int client, char[] name, char[] categ
         BotShared_ResetBotState(client);
 
         g_bPlayingRoundStartRec[client] = false;
+
+        // 停止语音
+        if (BotVoice_IsSpeaking(client))
+        {
+            BotVoice_StopSpeaking(client);
+        }
         
         // 使用公共函数清理所有timer
         CleanupClientTimers(client);
@@ -691,8 +697,8 @@ void AssignAndPlayRec(int client)
     // 根据模式选择rec
     if (g_bEconomyBasedSelection)
     {
-        int iTeam = GetClientTeam(client);
-        int iSelectedRound = g_iSelectedRoundForTeam[iTeam];
+        int iClientTeam = GetClientTeam(client);
+        int iSelectedRound = g_iSelectedRoundForTeam[iClientTeam];
         
         if (iSelectedRound != -1)
         {
@@ -722,11 +728,7 @@ void AssignAndPlayRec(int client)
         if (bPurchaseLoaded)
         {
             // 清理旧的购买timer
-            if (g_hPurchaseTimer[client] != null)
-            {
-                KillTimer(g_hPurchaseTimer[client]);
-                g_hPurchaseTimer[client] = null;
-            }
+            KillClientTimer(g_hPurchaseTimer[client]);
             
             // 创建购买执行timer
             DataPack pack = new DataPack();
@@ -741,17 +743,34 @@ void AssignAndPlayRec(int client)
         if (bChatLoaded)
         {
             // 清理旧的聊天timer
-            if (g_hChatTimer[client] != null)
-            {
-                KillTimer(g_hChatTimer[client]);
-                g_hChatTimer[client] = null;
-            }
+            KillClientTimer(g_hChatTimer[client]);
             
             // 创建聊天执行timer
             DataPack pack = new DataPack();
             pack.WriteCell(GetClientUserId(client));
             g_hChatTimer[client] = CreateTimer(0.1, Timer_ExecuteChatAction, pack, 
                 TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+        }
+
+        // 加载语音数据
+        bool bVoiceLoaded = LoadVoiceActionsForBot(client, iRoundToUse);
+
+        if (bVoiceLoaded)
+        {
+            // 清理旧的语音timer
+            KillClientTimer(g_hVoiceTimer[client]);
+    
+            // 创建语音执行timer
+            DataPack pack = new DataPack();
+            pack.WriteCell(GetClientUserId(client));
+            g_hVoiceTimer[client] = CreateTimer(0.1, Timer_ExecuteVoiceAction, pack, 
+                TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+    
+            PrintToServer("[Voice] Created voice timer for %s", szBotName); 
+        }
+        else
+        {
+            PrintToServer("[Voice] Failed to load voice for %s", szBotName); 
         }
         
         // 开始播放REC
@@ -824,12 +843,12 @@ bool GetRoundStartRec(int client, int iRound, char[] szPath, int iMaxLen)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
-    int iTeam = GetClientTeam(client);
+    int iClientTeam = GetClientTeam(client);
     char szTeamName[4];
     
-    if (iTeam == CS_TEAM_T)
+    if (iClientTeam == CS_TEAM_T)
         strcopy(szTeamName, sizeof(szTeamName), "T");
-    else if (iTeam == CS_TEAM_CT)
+    else if (iClientTeam == CS_TEAM_CT)
         strcopy(szTeamName, sizeof(szTeamName), "CT");
     else
         return false;
@@ -932,7 +951,7 @@ bool GetRoundStartRec(int client, int iRound, char[] szPath, int iMaxLen)
         {
             if (i == client || !IsValidClient(i) || !IsFakeClient(i))
                 continue;
-            if (GetClientTeam(i) == iTeam && g_iAssignedRecIndex[i] != -1)
+            if (GetClientTeam(i) == iClientTeam && g_iAssignedRecIndex[i] != -1)
                 iAssignedCount++;
         }
         g_iAssignedRecIndex[client] = iAssignedCount % hRecFiles.Length;
@@ -966,94 +985,69 @@ bool GetRoundStartRecForRound(int client, int iRound, char[] szPath, int iMaxLen
 
 bool GetRoundStartMoney(int client, int iRound)
 {
-    char szMap[64];
-    GetCurrentMap(szMap, sizeof(szMap));
-    GetMapDisplayName(szMap, szMap, sizeof(szMap));
-    
-    int iTeam = GetClientTeam(client);
+    int iClientTeam = GetClientTeam(client);
     char szTeamName[4];
     
-    if (iTeam == CS_TEAM_T)
+    if (iClientTeam == CS_TEAM_T)
         strcopy(szTeamName, sizeof(szTeamName), "T");
-    else if (iTeam == CS_TEAM_CT)
+    else if (iClientTeam == CS_TEAM_CT)
         strcopy(szTeamName, sizeof(szTeamName), "CT");
     else
         return false;
     
-    // 使用demo专属的money配置
-    char szUseDemoFolder[PLATFORM_MAX_PATH];
-    GetUseDemoFolder(client, szUseDemoFolder, sizeof(szUseDemoFolder));
-    
-    if (szUseDemoFolder[0] == '\0')
+    // 使用缓存的money数据
+    if (g_jMoneyData == null)
     {
         g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
         return true;
-    }
-    
-    char szJsonPath[PLATFORM_MAX_PATH];
-    BuildPath(Path_SM, szJsonPath, sizeof(szJsonPath), 
-        "data/botmimic/all/%s/%s/money.json", szMap, szUseDemoFolder);
-    
-    if (!FileExists(szJsonPath))
-    {
-        g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
-        return true;
-    }
-    
-    JSONObject jRoot = JSONObject.FromFile(szJsonPath);
-    if (jRoot == null)
-    {
-        g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
-        return false;
     }
     
     char szRoundKey[32];
     Format(szRoundKey, sizeof(szRoundKey), "round%d", iRound + 1);
     
-    if (!jRoot.HasKey(szRoundKey))
+    if (!g_jMoneyData.HasKey(szRoundKey))
     {
-        delete jRoot;
         g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
         return true;
     }
     
-    JSONObject jRound = view_as<JSONObject>(jRoot.Get(szRoundKey));
+    JSONObject jRound = view_as<JSONObject>(g_jMoneyData.Get(szRoundKey));
     if (!jRound.HasKey(szTeamName))
     {
         delete jRound;
-        delete jRoot;
         g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
         return true;
     }
     
     JSONObject jTeam = view_as<JSONObject>(jRound.Get(szTeamName));
     
-    // 使用REC名称获取金钱(新格式)
+    // 使用REC名称获取金钱
     if (g_szCurrentRecName[client][0] != '\0' && jTeam.HasKey(g_szCurrentRecName[client]))
     {
         g_iRecStartMoney[client] = jTeam.GetInt(g_szCurrentRecName[client]);
         
         delete jTeam;
         delete jRound;
-        delete jRoot;
         return true;
     }
     
     // 失败则使用默认值
     delete jTeam;
     delete jRound;
-    delete jRoot;
     
     g_iRecStartMoney[client] = g_bEconomyBasedSelection ? GetEntProp(client, Prop_Send, "m_iAccount") : 16000;
     return true;
 }
 
 // ============================================================================
-// 经济模式 - 回合选择
+// 经济模式 - 单队回合选择
 // ============================================================================
 
 void SelectRoundByEconomy(int iTeam)
 {
+    if (iTeam < 0 || iTeam >= 4)
+        return;
+    
     char szTeamName[4];
     if (iTeam == CS_TEAM_T)
         strcopy(szTeamName, sizeof(szTeamName), "T");
@@ -1062,7 +1056,7 @@ void SelectRoundByEconomy(int iTeam)
     else
         return;
     
-    // 收集该队伍所有bot并按经济排序
+    // 收集该队伍所有bot
     ArrayList hTeamBots = new ArrayList();
     for (int i = 1; i <= MaxClients; i++)
     {
@@ -1080,28 +1074,39 @@ void SelectRoundByEconomy(int iTeam)
     // 按经济从低到高排序
     SortADTArrayCustom(hTeamBots, Sort_BotsByMoney);
     
-    // 计算团队总经济
-    int iTotalMoney = 0;
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int client = hTeamBots.Get(i);
-        iTotalMoney += GetEntProp(client, Prop_Send, "m_iAccount");
-    }
-    
-    // 判断是否所有bot经济都小于3000
-    bool bAllUnder3000 = true;
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int client = hTeamBots.Get(i);
-        if (GetEntProp(client, Prop_Send, "m_iAccount") >= 3000)
-        {
-            bAllUnder3000 = false;
-            break;
-        }
-    }
-    
     // 判断当前是否手枪局
     bool bCurrentIsPistol = IsCurrentRoundPistol();
+    
+    // 确定经济需求类型
+    EconomyDemandType demandType = Demand_FullForce;  // 默认强起
+    
+    if (!bCurrentIsPistol)  // 非手枪局才判断经济需求
+    {
+        // 检查是否所有bot经济≤3000
+        bool bAllLowEconomy = true;
+        for (int b = 0; b < iBotCount; b++)
+        {
+            int client = hTeamBots.Get(b);
+            int clientMoney = GetEntProp(client, Prop_Send, "m_iAccount");
+            if (clientMoney > 3000)
+            {
+                bAllLowEconomy = false;
+                break;
+            }
+        }
+        
+        // 如果所有bot经济≤3000,随机决定需求类型
+        if (bAllLowEconomy)
+        {
+            int iRandom = GetRandomInt(1, 100);
+            if (iRandom <= 55) 
+                demandType = Demand_Eco;
+            else if (iRandom <= 80)  
+                demandType = Demand_SemiForce;
+            else  
+                demandType = Demand_FullForce;
+        }
+    }
     
     // 获取地图和所有demo文件夹
     char szMap[64];
@@ -1117,6 +1122,7 @@ void SelectRoundByEconomy(int iTeam)
         return;
     }
     
+    // 获取所有demo文件夹
     ArrayList hDemoFolders = new ArrayList(PLATFORM_MAX_PATH);
     DirectoryListing hMapDir = OpenDirectory(szMapBasePath);
     if (hMapDir != null)
@@ -1134,12 +1140,16 @@ void SelectRoundByEconomy(int iTeam)
         delete hMapDir;
     }
     
+    // 寻找最佳回合
     int iBestRound = -1;
     char szBestDemo[PLATFORM_MAX_PATH];
-    int iBestValue = bAllUnder3000 ? 999999 : 0;
-    KnapsackResult bestResult;
-    bestResult.isValid = false;
+    int iBestScore = -999999;  
+    int bestAssignment[MAXPLAYERS+1];
     
+    for (int i = 0; i <= MAXPLAYERS; i++)
+        bestAssignment[i] = -1;
+    
+    // 遍历所有demo
     for (int d = 0; d < hDemoFolders.Length; d++)
     {
         char szDemoFolder[PLATFORM_MAX_PATH];
@@ -1148,7 +1158,7 @@ void SelectRoundByEconomy(int iTeam)
         // 加载该demo的freeze时间
         float fDemoFreezeTimes[31];
         bool bDemoFreezeValid[31];
-        if (!LoadFreezeTimesForDemo(szMap, szDemoFolder, fDemoFreezeTimes, bDemoFreezeValid))
+        if (!LoadFreezeTimes(szMap, szDemoFolder, fDemoFreezeTimes, bDemoFreezeValid))
         {
             continue;
         }
@@ -1188,7 +1198,7 @@ void SelectRoundByEconomy(int iTeam)
             
             // 获取该回合的REC文件列表
             ArrayList hRecFiles = GetRecFilesForRound(szMap, szDemoFolder, iRound, szTeamName);
-            if (hRecFiles.Length == 0)
+            if (hRecFiles.Length < iBotCount)
             {
                 delete hRecFiles;
                 delete jTeam;
@@ -1197,9 +1207,9 @@ void SelectRoundByEconomy(int iTeam)
             }
             
             // 构建REC装备信息缓存
-            ArrayList hRecInfoList = BuildRecEquipmentCache(hRecFiles, jTeam, iTeam);
+            ArrayList hRecInfoList = BuildRecEquipmentInfo(hRecFiles, jTeam, iTeam);
             
-            if (hRecInfoList.Length == 0)
+            if (hRecInfoList.Length < iBotCount)
             {
                 delete hRecInfoList;
                 delete hRecFiles;
@@ -1208,33 +1218,99 @@ void SelectRoundByEconomy(int iTeam)
                 continue;
             }
             
-            //  运行背包DP算法 
-            KnapsackResult dpResult;
-            dpResult = SolveKnapsackDP(hTeamBots, hRecInfoList, iTotalMoney);
+            // 尝试为每个Bot分配REC
+            int tempAssignment[MAXPLAYERS+1];
+            for (int i = 0; i <= MAXPLAYERS; i++)
+                tempAssignment[i] = -1;
             
-            if (dpResult.isValid)
+            ArrayList usedRecIndices = new ArrayList();
+            int iTotalValue = 0;
+            int iTotalCost = 0;
+            bool bAllAssigned = true;
+            
+            // 从钱最少的Bot开始分配
+            for (int b = 0; b < iBotCount; b++)
             {
-                bool bIsBetter = false;
+                int client = hTeamBots.Get(b);
+                int clientMoney = GetEntProp(client, Prop_Send, "m_iAccount");
                 
-                if (bAllUnder3000)
+                // 找到该Bot能买得起且价值最高的REC
+                int iBestRecIndex = -1;
+                int iBestRecValue = -1;
+                
+                for (int r = 0; r < hRecInfoList.Length; r++)
                 {
-                    // 低经济:选择总价值最小的
-                    if (dpResult.totalValue < iBestValue)
-                        bIsBetter = true;
-                }
-                else
-                {
-                    // 高经济:选择总价值最大的
-                    if (dpResult.totalValue > iBestValue)
-                        bIsBetter = true;
+                    // 检查是否已被使用
+                    if (usedRecIndices.FindValue(r) != -1)
+                        continue;
+                    
+                    RecEquipmentInfo recInfo;
+                    hRecInfoList.GetArray(r, recInfo, sizeof(RecEquipmentInfo));
+                    
+                    // 检查Bot是否买得起
+                    if (recInfo.totalCost > clientMoney)
+                        continue;
+                    
+                    // 选择价值最高的
+                    if (recInfo.totalValue > iBestRecValue)
+                    {
+                        iBestRecIndex = r;
+                        iBestRecValue = recInfo.totalValue;
+                    }
                 }
                 
-                if (bIsBetter)
+                // 如果找不到能买得起的REC,这个回合不合格
+                if (iBestRecIndex == -1)
+                {
+                    bAllAssigned = false;
+                    break;
+                }
+                
+                // 分配REC
+                tempAssignment[b] = iBestRecIndex;
+                usedRecIndices.Push(iBestRecIndex);
+                
+                RecEquipmentInfo recInfo;
+                hRecInfoList.GetArray(iBestRecIndex, recInfo, sizeof(RecEquipmentInfo));
+                iTotalValue += recInfo.totalValue;
+                iTotalCost += recInfo.totalCost;
+            }
+            
+            delete usedRecIndices;
+            
+            // 如果所有Bot都分配成功,根据需求类型计算分数
+            if (bAllAssigned)
+            {
+                int iScore = 0;
+                
+                if (demandType == Demand_Eco)
+                {
+                    // Eco模式:花费越低越好
+                    iScore = -iTotalCost;
+                }
+                else if (demandType == Demand_SemiForce)
+                {
+                    // 半起模式
+                    int iTargetCost = iBotCount * 1750;  
+                    int iDeviation = (iTotalCost - iTargetCost);
+                    if (iDeviation < 0) iDeviation = -iDeviation;
+                    iScore = -iDeviation;  // 偏离越小越好
+                }
+                else  
+                {
+                    // 强起模式:价值越高越好
+                    iScore = iTotalValue;
+                }
+                
+                // 更新最佳回合
+                if (iScore > iBestScore)
                 {
                     iBestRound = iRound;
                     strcopy(szBestDemo, sizeof(szBestDemo), szDemoFolder);
-                    iBestValue = dpResult.totalValue;
-                    bestResult = dpResult;
+                    iBestScore = iScore;
+                    
+                    for (int i = 0; i <= MAXPLAYERS; i++)
+                        bestAssignment[i] = tempAssignment[i];
                 }
             }
             
@@ -1247,38 +1323,23 @@ void SelectRoundByEconomy(int iTeam)
         delete jDemoPurchaseData;
     }
     
+    delete hDemoFolders;
+    
+    // 如果没找到合适的回合
     if (iBestRound == -1)
     {
-        delete hDemoFolders;
         delete hTeamBots;
         return;
     }
     
-    // 重新加载最佳回合的数据并打印详情
-    ArrayList hBestRecFiles = GetRecFilesForRound(szMap, szBestDemo, iBestRound, szTeamName);
-    
-    // 第二阶段:局部搜索优化
-    JSONObject jBestPurchaseData = LoadPurchaseDataForDemo(szMap, szBestDemo);
-    char szRoundKey[32];
-    Format(szRoundKey, sizeof(szRoundKey), "round%d", iBestRound + 1);
-    JSONObject jBestRound = view_as<JSONObject>(jBestPurchaseData.Get(szRoundKey));
-    JSONObject jBestTeam = view_as<JSONObject>(jBestRound.Get(szTeamName));
-    
-    hBestRecFiles = GetRecFilesForRound(szMap, szBestDemo, iBestRound, szTeamName);
-    ArrayList hBestRecInfoList = BuildRecEquipmentCache(hBestRecFiles, jBestTeam, iTeam);
-    
-    // 运行局部搜索优化
-    KnapsackResult optimizedResult;
-    optimizedResult = LocalSearchOptimize(bestResult, hTeamBots, hBestRecInfoList, iTotalMoney);
-    
-    // 虚拟发枪模拟与最终分配
-    // 保存选择的回合和demo
+    // 应用最终分配
     g_iSelectedRoundForTeam[iTeam] = iBestRound;
     strcopy(g_szSelectedDemoForTeam[iTeam], PLATFORM_MAX_PATH, szBestDemo);
     
+    // 设置验证延迟时间
     float fDemoFreezeTimes[31];
     bool bDemoFreezeValid[31];
-    if (LoadFreezeTimesForDemo(szMap, szBestDemo, fDemoFreezeTimes, bDemoFreezeValid))
+    if (LoadFreezeTimes(szMap, szBestDemo, fDemoFreezeTimes, bDemoFreezeValid))
     {
         if (bDemoFreezeValid[iBestRound])
         {
@@ -1302,11 +1363,21 @@ void SelectRoundByEconomy(int iTeam)
         delete g_hAssignedRecsForTeam[iTeam];
     g_hAssignedRecsForTeam[iTeam] = new ArrayList(ByteCountToCells(PLATFORM_MAX_PATH));
     
-    // 应用最终分配并模拟发枪
+    // 重新加载最佳回合的数据并分配
+    JSONObject jBestPurchaseData = LoadPurchaseDataForDemo(szMap, szBestDemo);
+    char szRoundKey[32];
+    Format(szRoundKey, sizeof(szRoundKey), "round%d", iBestRound + 1);
+    JSONObject jBestRound = view_as<JSONObject>(jBestPurchaseData.Get(szRoundKey));
+    JSONObject jBestTeam = view_as<JSONObject>(jBestRound.Get(szTeamName));
+    
+    ArrayList hBestRecFiles = GetRecFilesForRound(szMap, szBestDemo, iBestRound, szTeamName);
+    ArrayList hBestRecInfoList = BuildRecEquipmentInfo(hBestRecFiles, jBestTeam, iTeam);
+    
+    // 给每个Bot分配REC
     for (int b = 0; b < iBotCount; b++)
     {
         int client = hTeamBots.Get(b);
-        int recIndex = optimizedResult.assignment[b];
+        int recIndex = bestAssignment[b];
         
         if (recIndex >= 0 && recIndex < hBestRecInfoList.Length)
         {
@@ -1315,20 +1386,17 @@ void SelectRoundByEconomy(int iTeam)
             
             g_hAssignedRecsForTeam[iTeam].PushString(recInfo.recName);
             
-            // 直接保存到bot专属变量
+            // 保存到bot专属变量
             strcopy(g_szAssignedRecName[client], PLATFORM_MAX_PATH, recInfo.recName);
             strcopy(g_szBotRecFolder[client], PLATFORM_MAX_PATH, szBestDemo);
         }
         else
         {
-            // 清空未分配bot的数据，防止使用旧值
+            // 清空未分配bot的数据
             g_szAssignedRecName[client][0] = '\0';
             g_szBotRecFolder[client][0] = '\0';
         }
     }
-    
-    // 虚拟发枪模拟
-    SimulateDropSystem(hTeamBots, optimizedResult, hBestRecInfoList);
     
     // 清理资源
     delete hBestRecInfoList;
@@ -1336,9 +1404,12 @@ void SelectRoundByEconomy(int iTeam)
     delete jBestTeam;
     delete jBestRound;
     delete jBestPurchaseData;
-    delete hDemoFolders;
     delete hTeamBots;
 }
+
+// ============================================================================
+// 经济模式 - 双队回合选择
+// ============================================================================
 
 int SelectRoundByBothTeamsEconomy()
 {
@@ -1375,55 +1446,76 @@ int SelectRoundByBothTeamsEconomy()
         delete hCTBots;
         return g_iCurrentRound;
     }
-
-    // 计算团队总经济
-    int iTTotalMoney = 0;
-    int iCTTotalMoney = 0;
-    
-    for (int i = 0; i < iTBotCount; i++)
-    {
-        int client = hTBots.Get(i);
-        iTTotalMoney += GetEntProp(client, Prop_Send, "m_iAccount");
-    }
-    
-    for (int i = 0; i < iCTBotCount; i++)
-    {
-        int client = hCTBots.Get(i);
-        iCTTotalMoney += GetEntProp(client, Prop_Send, "m_iAccount");
-    }
-    
-    // 判断是否所有bot经济都小于3000
-    bool bAllUnder3000 = true;
-    
-    for (int i = 0; i < iTBotCount; i++)
-    {
-        int client = hTBots.Get(i);
-        if (GetEntProp(client, Prop_Send, "m_iAccount") >= 3000)
-        {
-            bAllUnder3000 = false;
-            break;
-        }
-    }
-    
-    if (bAllUnder3000)
-    {
-        for (int i = 0; i < iCTBotCount; i++)
-        {
-            int client = hCTBots.Get(i);
-            if (GetEntProp(client, Prop_Send, "m_iAccount") >= 3000)
-            {
-                bAllUnder3000 = false;
-                break;
-            }
-        }
-    }
     
     // 判断当前是否手枪局
     bool bCurrentIsPistol = IsCurrentRoundPistol();
     
+    // 确定T队的经济需求类型
+    EconomyDemandType tDemandType = Demand_FullForce;
+    if (!bCurrentIsPistol && iTBotCount > 0)
+    {
+        bool bTAllLowEconomy = true;
+        for (int b = 0; b < iTBotCount; b++)
+        {
+            int client = hTBots.Get(b);
+            int clientMoney = GetEntProp(client, Prop_Send, "m_iAccount");
+            if (clientMoney > 3000)
+            {
+                bTAllLowEconomy = false;
+                break;
+            }
+        }
+        
+        if (bTAllLowEconomy)
+        {
+            int iRandom = GetRandomInt(1, 100);
+            if (iRandom <= 55)
+                tDemandType = Demand_Eco;
+            else if (iRandom <= 80)
+                tDemandType = Demand_SemiForce;
+            else
+                tDemandType = Demand_FullForce;
+        }
+    }
+    
+    // 确定CT队的经济需求类型
+    EconomyDemandType ctDemandType = Demand_FullForce;
+    if (!bCurrentIsPistol && iCTBotCount > 0)
+    {
+        bool bCTAllLowEconomy = true;
+        for (int b = 0; b < iCTBotCount; b++)
+        {
+            int client = hCTBots.Get(b);
+            int clientMoney = GetEntProp(client, Prop_Send, "m_iAccount");
+            if (clientMoney > 3000)
+            {
+                bCTAllLowEconomy = false;
+                break;
+            }
+        }
+        
+        if (bCTAllLowEconomy)
+        {
+            int iRandom = GetRandomInt(1, 100);
+            if (iRandom <= 55)
+                ctDemandType = Demand_Eco;
+            else if (iRandom <= 80)
+                ctDemandType = Demand_SemiForce;
+            else
+                ctDemandType = Demand_FullForce;
+        }
+    }
+    
     // 获取所有demo文件夹
     char szMapBasePath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szMapBasePath, sizeof(szMapBasePath), "data/botmimic/all/%s", szMap);
+    
+    if (!DirExists(szMapBasePath))
+    {
+        delete hTBots;
+        delete hCTBots;
+        return g_iCurrentRound;
+    }
     
     ArrayList hDemoFolders = new ArrayList(PLATFORM_MAX_PATH);
     DirectoryListing hMapDir = OpenDirectory(szMapBasePath);
@@ -1442,26 +1534,22 @@ int SelectRoundByBothTeamsEconomy()
         delete hMapDir;
     }
     
-    // 扫描所有回合，使用背包DP找最优回合
-    int iBestRound = -1;
-    char szBestDemo[PLATFORM_MAX_PATH];
-    int iBestTotalValue = bAllUnder3000 ? 999999 : 0;
-    KnapsackResult bestTResult;
-    KnapsackResult bestCTResult;
-    bestTResult.isValid = false;
-    bestCTResult.isValid = false;
+    // 收集所有可行回合
+    ArrayList hTSatisfiedRounds = new ArrayList(sizeof(RoundCandidate));
+    ArrayList hCTSatisfiedRounds = new ArrayList(sizeof(RoundCandidate));
     
+    // 遍历所有demo和回合
     for (int d = 0; d < hDemoFolders.Length; d++)
     {
         char szDemoFolder[PLATFORM_MAX_PATH];
         hDemoFolders.GetString(d, szDemoFolder, sizeof(szDemoFolder));
         
-        // 加载该demo的freeze时间
+        // 加载freeze时间
         float fDemoFreezeTimes[31];
         bool bDemoFreezeValid[31];
-        LoadFreezeTimesForDemo(szMap, szDemoFolder, fDemoFreezeTimes, bDemoFreezeValid);
+        LoadFreezeTimes(szMap, szDemoFolder, fDemoFreezeTimes, bDemoFreezeValid);
         
-        // 加载该demo的购买数据
+        // 加载购买数据
         JSONObject jDemoPurchaseData = LoadPurchaseDataForDemo(szMap, szDemoFolder);
         if (jDemoPurchaseData == null)
             continue;
@@ -1485,100 +1573,124 @@ int SelectRoundByBothTeamsEconomy()
             
             JSONObject jRound = view_as<JSONObject>(jDemoPurchaseData.Get(szRoundKey));
             
-            // 为T队运行背包DP
-            KnapsackResult tResult;
-            tResult.isValid = false;
-            
+            // 检查T队 - 只要能分配就加入候选
             if (iTBotCount > 0 && jRound.HasKey("T"))
             {
                 JSONObject jTeamT = view_as<JSONObject>(jRound.Get("T"));
-                
                 ArrayList hTRecFiles = GetRecFilesForRound(szMap, szDemoFolder, iRound, "T");
+                ArrayList hTRecInfoList = null;
                 
-                if (hTRecFiles.Length > 0)
+                if (hTRecFiles.Length >= iTBotCount)
                 {
-                    ArrayList hTRecInfoList = BuildRecEquipmentCache(hTRecFiles, jTeamT, CS_TEAM_T);
-                    tResult = SolveKnapsackDP(hTBots, hTRecInfoList, iTTotalMoney);
-                    delete hTRecInfoList;
+                    hTRecInfoList = BuildRecEquipmentInfo(hTRecFiles, jTeamT, CS_TEAM_T);
+                    
+                    if (hTRecInfoList != null && hTRecInfoList.Length >= iTBotCount)
+                    {
+                        int tempTAssignment[MAXPLAYERS+1];
+                        for (int i = 0; i <= MAXPLAYERS; i++)
+                            tempTAssignment[i] = -1;
+                        
+                        int iTTotalValue = 0;
+                        int iTTotalCost = 0;
+                        bool bTAssigned = TryAssignRecsToTeamWithCost(hTBots, hTRecInfoList, 
+                                                                       tempTAssignment, 
+                                                                       iTTotalValue, 
+                                                                       iTTotalCost);
+                        
+                        if (bTAssigned)
+                        {
+                            RoundCandidate candidate;
+                            candidate.round = iRound;
+                            strcopy(candidate.demoFolder, PLATFORM_MAX_PATH, szDemoFolder);
+                            
+                            if (tDemandType == Demand_Eco)
+                                candidate.totalValue = -iTTotalCost;
+                            else if (tDemandType == Demand_SemiForce)
+                            {
+                                int iTargetCost = iTBotCount * 1750;
+                                int iDeviation = (iTTotalCost - iTargetCost);
+                                if (iDeviation < 0) iDeviation = -iDeviation;
+                                candidate.totalValue = -iDeviation;
+                            }
+                            else
+                                candidate.totalValue = iTTotalValue;
+                            
+                            candidate.freezeTime = fDemoFreezeTimes[iRound];
+                            
+                            for (int i = 0; i < iTBotCount; i++)
+                                candidate.assignment[i] = tempTAssignment[i];
+                            
+                            hTSatisfiedRounds.PushArray(candidate, sizeof(RoundCandidate));
+                        }
+                    }
                 }
                 
+                // 统一清理，无论执行了哪个分支
+                if (hTRecInfoList != null)
+                    delete hTRecInfoList;
                 delete hTRecFiles;
                 delete jTeamT;
             }
-            else if (iTBotCount > 0)
-            {
-                // T队没有数据，视为无效
-                tResult.isValid = false;
-            }
-            else
-            {
-                // 没有T bot，自动通过
-                tResult.isValid = true;
-                tResult.totalValue = 0;
-            }
             
-            // 为CT队运行背包DP 
-            KnapsackResult ctResult;
-            ctResult.isValid = false;
-            
+            // 检查CT队 - 只要能分配就加入候选
             if (iCTBotCount > 0 && jRound.HasKey("CT"))
             {
                 JSONObject jTeamCT = view_as<JSONObject>(jRound.Get("CT"));
-                
                 ArrayList hCTRecFiles = GetRecFilesForRound(szMap, szDemoFolder, iRound, "CT");
+                ArrayList hCTRecInfoList = null;
                 
-                if (hCTRecFiles.Length > 0)
+                if (hCTRecFiles.Length >= iCTBotCount)
                 {
-                    ArrayList hCTRecInfoList = BuildRecEquipmentCache(hCTRecFiles, jTeamCT, CS_TEAM_CT);
-                    ctResult = SolveKnapsackDP(hCTBots, hCTRecInfoList, iCTTotalMoney);
-                    delete hCTRecInfoList;
+                    hCTRecInfoList = BuildRecEquipmentInfo(hCTRecFiles, jTeamCT, CS_TEAM_CT);
+                    
+                    if (hCTRecInfoList != null && hCTRecInfoList.Length >= iCTBotCount)
+                    {
+                        int tempCTAssignment[MAXPLAYERS+1];
+                        for (int i = 0; i <= MAXPLAYERS; i++)
+                            tempCTAssignment[i] = -1;
+                        
+                        int iCTTotalValue = 0;
+                        int iCTTotalCost = 0;
+                        bool bCTAssigned = TryAssignRecsToTeamWithCost(hCTBots, hCTRecInfoList, 
+                                                                        tempCTAssignment, 
+                                                                        iCTTotalValue, 
+                                                                        iCTTotalCost);
+                        
+                        if (bCTAssigned)
+                        {
+                            RoundCandidate candidate;
+                            candidate.round = iRound;
+                            strcopy(candidate.demoFolder, PLATFORM_MAX_PATH, szDemoFolder);
+                            
+                            if (ctDemandType == Demand_Eco)
+                                candidate.totalValue = -iCTTotalCost;
+                            else if (ctDemandType == Demand_SemiForce)
+                            {
+                                int iTargetCost = iCTBotCount * 1750;
+                                int iDeviation = (iCTTotalCost - iTargetCost);
+                                if (iDeviation < 0) iDeviation = -iDeviation;
+                                candidate.totalValue = -iDeviation;
+                            }
+                            else
+                                candidate.totalValue = iCTTotalValue;
+                            
+                            candidate.freezeTime = fDemoFreezeTimes[iRound];
+                            
+                            for (int i = 0; i < iCTBotCount; i++)
+                                candidate.assignment[i] = tempCTAssignment[i];
+                            
+                            hCTSatisfiedRounds.PushArray(candidate, sizeof(RoundCandidate));
+                        }
+                    }
                 }
                 
+                if (hCTRecInfoList != null)
+                    delete hCTRecInfoList;
                 delete hCTRecFiles;
                 delete jTeamCT;
             }
-            else if (iCTBotCount > 0)
-            {
-                // CT队没有数据，视为无效
-                ctResult.isValid = false;
-            }
-            else
-            {
-                // 没有CT bot，自动通过
-                ctResult.isValid = true;
-                ctResult.totalValue = 0;
-            }
             
             delete jRound;
-            
-            // 如果双方都有有效解
-            if (tResult.isValid && ctResult.isValid)
-            {
-                int iTotalValue = tResult.totalValue + ctResult.totalValue;
-                bool bIsBetter = false;
-                
-                if (bAllUnder3000)
-                {
-                    // 低经济：选择总价值最小的
-                    if (iTotalValue < iBestTotalValue)
-                        bIsBetter = true;
-                }
-                else
-                {
-                    // 高经济：选择总价值最大的
-                    if (iTotalValue > iBestTotalValue)
-                        bIsBetter = true;
-                }
-                
-                if (bIsBetter)
-                {
-                    iBestRound = iRound;
-                    strcopy(szBestDemo, sizeof(szBestDemo), szDemoFolder);
-                    iBestTotalValue = iTotalValue;
-                    bestTResult = tResult;
-                    bestCTResult = ctResult;
-                }
-            }
         }
         
         delete jDemoPurchaseData;
@@ -1586,75 +1698,153 @@ int SelectRoundByBothTeamsEconomy()
     
     delete hDemoFolders;
     
+    // 选择两边都相对满意的回合 
+    int iBestRound = -1;
+    char szBestDemo[PLATFORM_MAX_PATH];
+    float fBestSatisfaction = -999999.0; 
+    int bestTAssignment[MAXPLAYERS+1];
+    int bestCTAssignment[MAXPLAYERS+1];
+    
+    for (int i = 0; i <= MAXPLAYERS; i++)
+    {
+        bestTAssignment[i] = -1;
+        bestCTAssignment[i] = -1;
+    }
+    
+    // 计算每队的理论最大分数
+    int iTMaxPossibleScore = -999999;
+    int iCTMaxPossibleScore = -999999;
+    
+    for (int t = 0; t < hTSatisfiedRounds.Length; t++)
+    {
+        RoundCandidate tCandidate;
+        hTSatisfiedRounds.GetArray(t, tCandidate, sizeof(RoundCandidate));
+        if (tCandidate.totalValue > iTMaxPossibleScore)
+            iTMaxPossibleScore = tCandidate.totalValue;
+    }
+    
+    for (int ct = 0; ct < hCTSatisfiedRounds.Length; ct++)
+    {
+        RoundCandidate ctCandidate;
+        hCTSatisfiedRounds.GetArray(ct, ctCandidate, sizeof(RoundCandidate));
+        if (ctCandidate.totalValue > iCTMaxPossibleScore)
+            iCTMaxPossibleScore = ctCandidate.totalValue;
+    }
+    
+    // 计算每队的理论最小分数
+    int iTMinPossibleScore = 999999;
+    int iCTMinPossibleScore = 999999;
+    
+    for (int t = 0; t < hTSatisfiedRounds.Length; t++)
+    {
+        RoundCandidate tCandidate;
+        hTSatisfiedRounds.GetArray(t, tCandidate, sizeof(RoundCandidate));
+        if (tCandidate.totalValue < iTMinPossibleScore)
+            iTMinPossibleScore = tCandidate.totalValue;
+    }
+    
+    for (int ct = 0; ct < hCTSatisfiedRounds.Length; ct++)
+    {
+        RoundCandidate ctCandidate;
+        hCTSatisfiedRounds.GetArray(ct, ctCandidate, sizeof(RoundCandidate));
+        if (ctCandidate.totalValue < iCTMinPossibleScore)
+            iCTMinPossibleScore = ctCandidate.totalValue;
+    }
+    
+    // 遍历T队回合,寻找CT队也有的回合
+    for (int t = 0; t < hTSatisfiedRounds.Length; t++)
+    {
+        RoundCandidate tCandidate;
+        hTSatisfiedRounds.GetArray(t, tCandidate, sizeof(RoundCandidate));
+        
+        for (int ct = 0; ct < hCTSatisfiedRounds.Length; ct++)
+        {
+            RoundCandidate ctCandidate;
+            hCTSatisfiedRounds.GetArray(ct, ctCandidate, sizeof(RoundCandidate));
+            
+            // 检查是否为同一回合同一demo
+            if (tCandidate.round == ctCandidate.round && 
+                StrEqual(tCandidate.demoFolder, ctCandidate.demoFolder, false))
+            {
+                // 归一化满意度(0.0-1.0)
+                float fTSatisfaction = 0.0;
+                float fCTSatisfaction = 0.0;
+                
+                // 归一化T队分数
+                if (iTMaxPossibleScore != iTMinPossibleScore)
+                {
+                    fTSatisfaction = float(tCandidate.totalValue - iTMinPossibleScore) / 
+                                    float(iTMaxPossibleScore - iTMinPossibleScore);
+                }
+                else
+                {
+                    fTSatisfaction = 1.0;
+                }
+                
+                // 归一化CT队分数
+                if (iCTMaxPossibleScore != iCTMinPossibleScore)
+                {
+                    fCTSatisfaction = float(ctCandidate.totalValue - iCTMinPossibleScore) / 
+                                     float(iCTMaxPossibleScore - iCTMinPossibleScore);
+                }
+                else
+                {
+                    fCTSatisfaction = 1.0;
+                }
+                
+                // 使用调和平均数作为综合满意度
+                float fCombinedSatisfaction = -999999.0;
+                if (fTSatisfaction > 0.0 && fCTSatisfaction > 0.0)
+                {
+                    fCombinedSatisfaction = 2.0 * fTSatisfaction * fCTSatisfaction / 
+                                          (fTSatisfaction + fCTSatisfaction);
+                }
+                
+                if (fCombinedSatisfaction > fBestSatisfaction)
+                {
+                    iBestRound = tCandidate.round;
+                    strcopy(szBestDemo, sizeof(szBestDemo), tCandidate.demoFolder);
+                    fBestSatisfaction = fCombinedSatisfaction;
+                    
+                    // 保存两队的分配方案
+                    for (int i = 0; i < iTBotCount; i++)
+                        bestTAssignment[i] = tCandidate.assignment[i];
+                    
+                    for (int i = 0; i < iCTBotCount; i++)
+                        bestCTAssignment[i] = ctCandidate.assignment[i];
+                }
+                
+                break;
+            }
+        }
+    }
+    
+    // 清理候选列表
+    delete hTSatisfiedRounds;
+    delete hCTSatisfiedRounds;
+    
     if (iBestRound == -1)
     {
+        PrintToServer("[Bot REC] No suitable round found for both teams!");
         delete hTBots;
         delete hCTBots;
         return g_iCurrentRound;
     }
     
-    // 第二阶段：局部搜索优化 
-    // 重新加载最佳回合的数据
-    JSONObject jBestPurchaseData = LoadPurchaseDataForDemo(szMap, szBestDemo);
-    char szRoundKey[32];
-    Format(szRoundKey, sizeof(szRoundKey), "round%d", iBestRound + 1);
-    JSONObject jBestRound = view_as<JSONObject>(jBestPurchaseData.Get(szRoundKey));
-    
-    // 复制T队结果
-    KnapsackResult optimizedTResult;
-    optimizedTResult.isValid = bestTResult.isValid;
-    optimizedTResult.totalValue = bestTResult.totalValue;
-    optimizedTResult.totalCost = bestTResult.totalCost;
-    for (int i = 0; i <= MAXPLAYERS; i++)
-        optimizedTResult.assignment[i] = bestTResult.assignment[i];
-
-    // 复制CT队结果
-    KnapsackResult optimizedCTResult;
-    optimizedCTResult.isValid = bestCTResult.isValid;
-    optimizedCTResult.totalValue = bestCTResult.totalValue;
-    optimizedCTResult.totalCost = bestCTResult.totalCost;
-    for (int i = 0; i <= MAXPLAYERS; i++)
-        optimizedCTResult.assignment[i] = bestCTResult.assignment[i];
-    
-    // 为T队优化
-    if (iTBotCount > 0 && jBestRound.HasKey("T"))
-    {
-        JSONObject jTeamT = view_as<JSONObject>(jBestRound.Get("T"));
-        ArrayList hTRecFiles = GetRecFilesForRound(szMap, szBestDemo, iBestRound, "T");
-        ArrayList hTRecInfoList = BuildRecEquipmentCache(hTRecFiles, jTeamT, CS_TEAM_T);
-        
-        optimizedTResult = LocalSearchOptimize(bestTResult, hTBots, hTRecInfoList, iTTotalMoney);
-        
-        delete hTRecInfoList;
-        delete hTRecFiles;
-        delete jTeamT;
-    }
-    
-    // 为CT队优化
-    if (iCTBotCount > 0 && jBestRound.HasKey("CT"))
-    {
-        JSONObject jTeamCT = view_as<JSONObject>(jBestRound.Get("CT"));
-        ArrayList hCTRecFiles = GetRecFilesForRound(szMap, szBestDemo, iBestRound, "CT");
-        ArrayList hCTRecInfoList = BuildRecEquipmentCache(hCTRecFiles, jTeamCT, CS_TEAM_CT);
-        
-        optimizedCTResult = LocalSearchOptimize(bestCTResult, hCTBots, hCTRecInfoList, iCTTotalMoney);
-        
-        delete hCTRecInfoList;
-        delete hCTRecFiles;
-        delete jTeamCT;
-    }
-    
-    // 第三阶段：应用最终分配 
-    // 保存选择的demo和回合
+    // 应用最终分配
     strcopy(g_szCurrentRecFolder, sizeof(g_szCurrentRecFolder), szBestDemo);
     g_iSelectedRoundForTeam[CS_TEAM_T] = iBestRound;
     g_iSelectedRoundForTeam[CS_TEAM_CT] = iBestRound;
     strcopy(g_szSelectedDemoForTeam[CS_TEAM_T], PLATFORM_MAX_PATH, szBestDemo);
     strcopy(g_szSelectedDemoForTeam[CS_TEAM_CT], PLATFORM_MAX_PATH, szBestDemo);
     
+    PrintToServer("[Bot REC] Selected round %d from demo %s (Satisfaction: %.2f)", 
+        iBestRound + 1, szBestDemo, fBestSatisfaction);
+    
+    // 设置验证延迟
     float fDemoFreezeTimes[31];
     bool bDemoFreezeValid[31];
-    if (LoadFreezeTimesForDemo(szMap, szBestDemo, fDemoFreezeTimes, bDemoFreezeValid))
+    if (LoadFreezeTimes(szMap, szBestDemo, fDemoFreezeTimes, bDemoFreezeValid))
     {
         if (bDemoFreezeValid[iBestRound])
         {
@@ -1687,17 +1877,24 @@ int SelectRoundByBothTeamsEconomy()
     g_hAssignedRecsForTeam[CS_TEAM_T] = new ArrayList(ByteCountToCells(PLATFORM_MAX_PATH));
     g_hAssignedRecsForTeam[CS_TEAM_CT] = new ArrayList(ByteCountToCells(PLATFORM_MAX_PATH));
     
+    // 重新加载最佳回合的数据
+    JSONObject jBestPurchaseData = LoadPurchaseDataForDemo(szMap, szBestDemo);
+    char szRoundKey[32];
+    Format(szRoundKey, sizeof(szRoundKey), "round%d", iBestRound + 1);
+    JSONObject jBestRound = view_as<JSONObject>(jBestPurchaseData.Get(szRoundKey));
+    
     // 为T队应用分配
     if (iTBotCount > 0 && jBestRound.HasKey("T"))
     {
         JSONObject jTeamT = view_as<JSONObject>(jBestRound.Get("T"));
         ArrayList hTRecFiles = GetRecFilesForRound(szMap, szBestDemo, iBestRound, "T");
-        ArrayList hTRecInfoList = BuildRecEquipmentCache(hTRecFiles, jTeamT, CS_TEAM_T);
+        ArrayList hTRecInfoList = BuildRecEquipmentInfo(hTRecFiles, jTeamT, CS_TEAM_T);
         
+        // 为T队应用分配
         for (int b = 0; b < iTBotCount; b++)
         {
             int client = hTBots.Get(b);
-            int recIndex = optimizedTResult.assignment[b];
+            int recIndex = bestTAssignment[b];
             
             if (recIndex >= 0 && recIndex < hTRecInfoList.Length)
             {
@@ -1705,21 +1902,15 @@ int SelectRoundByBothTeamsEconomy()
                 hTRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
                 
                 g_hAssignedRecsForTeam[CS_TEAM_T].PushString(recInfo.recName);
-                
-                // 直接保存到bot专属变量
                 strcopy(g_szAssignedRecName[client], PLATFORM_MAX_PATH, recInfo.recName);
                 strcopy(g_szBotRecFolder[client], PLATFORM_MAX_PATH, szBestDemo);
             }
             else
             {
-                // 清空未分配bot的数据，防止使用旧值
                 g_szAssignedRecName[client][0] = '\0';
                 g_szBotRecFolder[client][0] = '\0';
             }
         }
-        
-        // 虚拟发枪模拟
-        SimulateDropSystem(hTBots, optimizedTResult, hTRecInfoList);
         
         delete hTRecInfoList;
         delete hTRecFiles;
@@ -1731,12 +1922,12 @@ int SelectRoundByBothTeamsEconomy()
     {
         JSONObject jTeamCT = view_as<JSONObject>(jBestRound.Get("CT"));
         ArrayList hCTRecFiles = GetRecFilesForRound(szMap, szBestDemo, iBestRound, "CT");
-        ArrayList hCTRecInfoList = BuildRecEquipmentCache(hCTRecFiles, jTeamCT, CS_TEAM_CT);
+        ArrayList hCTRecInfoList = BuildRecEquipmentInfo(hCTRecFiles, jTeamCT, CS_TEAM_CT);
         
         for (int b = 0; b < iCTBotCount; b++)
         {
             int client = hCTBots.Get(b);
-            int recIndex = optimizedCTResult.assignment[b];
+            int recIndex = bestCTAssignment[b];
             
             if (recIndex >= 0 && recIndex < hCTRecInfoList.Length)
             {
@@ -1744,21 +1935,15 @@ int SelectRoundByBothTeamsEconomy()
                 hCTRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
                 
                 g_hAssignedRecsForTeam[CS_TEAM_CT].PushString(recInfo.recName);
-                
-                // 直接保存到bot专属变量
                 strcopy(g_szAssignedRecName[client], PLATFORM_MAX_PATH, recInfo.recName);
                 strcopy(g_szBotRecFolder[client], PLATFORM_MAX_PATH, szBestDemo);
             }
             else
             {
-                // 清空未分配bot的数据，防止使用旧值
                 g_szAssignedRecName[client][0] = '\0';
                 g_szBotRecFolder[client][0] = '\0';
             }
         }
-        
-        // 虚拟发枪模拟
-        SimulateDropSystem(hCTBots, optimizedCTResult, hCTRecInfoList);
         
         delete hCTRecInfoList;
         delete hCTRecFiles;
@@ -1767,7 +1952,6 @@ int SelectRoundByBothTeamsEconomy()
     
     delete jBestRound;
     delete jBestPurchaseData;
-    
     delete hTBots;
     delete hCTBots;
     
@@ -1793,11 +1977,9 @@ bool LoadPurchaseDataFile(const char[] szRecFolder)
         return false;
     }
     
-    // 清理旧数据
     if (g_jPurchaseData != null)
         delete g_jPurchaseData;
     
-    // 加载JSON
     g_jPurchaseData = JSONObject.FromFile(szPath);
     if (g_jPurchaseData == null)
     {
@@ -1808,7 +1990,7 @@ bool LoadPurchaseDataFile(const char[] szRecFolder)
     return true;
 }
 
-bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
+bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder, float fFreezeTimes[31], bool bValid[31])
 {
     char szFreezePath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szFreezePath, sizeof(szFreezePath), 
@@ -1819,13 +2001,14 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
     // 初始化所有回合为无效
     for (int i = 0; i < sizeof(g_bRoundFreezeTimeValid); i++)
     {
-        // 经济系统用（有tolerance检查）
         g_bRoundFreezeTimeValid[i] = false;
         g_fValidRoundFreezeTimes[i] = 0.0;
         
-        // 暂停系统用（无检查）
         g_bAllRoundFreezeTimeValid[i] = false;
         g_fAllRoundFreezeTimes[i] = 0.0;
+
+        bValid[i] = false;
+        fFreezeTimes[i] = 0.0;
     }
     
     g_fStandardFreezeTime = 20.0;
@@ -1897,7 +2080,6 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
             continue;
         }
         
-        // 解析回合时间: "round1: 20.5" 或 "1: 20.5"
         char szParts[2][64];
         int iParts = ExplodeString(szLine, ":", szParts, sizeof(szParts), sizeof(szParts[]));
         
@@ -1942,14 +2124,12 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
         // 数组索引 = 回合号 - 1
         int iArrayIndex = iRoundNum - 1;
         
-        // 分别处理两个系统 
-        
-        // 1. 暂停系统：无条件加载所有时间
+        // 暂停系统：无条件加载所有时间
         g_bAllRoundFreezeTimeValid[iArrayIndex] = true;
         g_fAllRoundFreezeTimes[iArrayIndex] = fFreezeTime;
         iValidRoundsForPause++;
         
-        // 2. 经济系统：只加载tolerance范围内的时间
+        // 经济模式：只加载tolerance范围内的时间
         float fDifference = FloatAbs(fFreezeTime - g_fStandardFreezeTime);
         
         if (fDifference <= TOLERANCE)
@@ -1957,6 +2137,9 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
             g_bRoundFreezeTimeValid[iArrayIndex] = true;
             g_fValidRoundFreezeTimes[iArrayIndex] = fFreezeTime;
             iValidRoundsForEconomy++;
+            
+            bValid[iArrayIndex] = true;
+            fFreezeTimes[iArrayIndex] = fFreezeTime;
         }
     }
     
@@ -1964,6 +2147,13 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder)
     
     PrintToServer("[Freeze Loader] Loaded %d rounds for pause, %d rounds for economy", 
         iValidRoundsForPause, iValidRoundsForEconomy);
+    
+    // 全局模式下，直接设置服务器冻结时间
+    if (g_iRoundMode == Round_FullMatch && g_fStandardFreezeTime > 0.0)
+    {
+        ServerCommand("mp_freezetime %.2f", g_fStandardFreezeTime);
+        PrintToServer("[Freeze Loader] Set server freeze time to %.2f seconds", g_fStandardFreezeTime);
+    }
     
     return (iValidRoundsForPause > 0 || iValidRoundsForEconomy > 0);
 }
@@ -1984,11 +2174,9 @@ bool LoadChatDataFile(const char[] szRecFolder)
         return false;
     }
     
-    // 清理旧数据
     if (g_jChatData != null)
         delete g_jChatData;
     
-    // 加载JSON
     g_jChatData = view_as<JSONArray>(JSONArray.FromFile(szPath));
     if (g_jChatData == null)
     {
@@ -2001,6 +2189,11 @@ bool LoadChatDataFile(const char[] szRecFolder)
 
 bool LoadChatActionsForBot(int client, int iRound)
 {
+    if (IsInWarmup())
+    {
+        return false;  
+    }
+
     if (g_jChatData == null)
     {
         return false;
@@ -2015,7 +2208,6 @@ bool LoadChatActionsForBot(int client, int iRound)
     char szBotRecName[PLATFORM_MAX_PATH];
     strcopy(szBotRecName, sizeof(szBotRecName), g_szCurrentRecName[client]);
     
-    // 清理旧数据
     if (g_hChatActions[client] != null)
         delete g_hChatActions[client];
     
@@ -2023,7 +2215,7 @@ bool LoadChatActionsForBot(int client, int iRound)
     g_iChatActionIndex[client] = 0;
     
     int iChatCount = 0;
-    int iTargetRound = iRound + 1;  // round1 = iRound 0
+    int iTargetRound = iRound + 1;  
     
     // 遍历所有聊天消息
     for (int i = 0; i < g_jChatData.Length; i++)
@@ -2055,7 +2247,7 @@ bool LoadChatActionsForBot(int client, int iRound)
         jMessage.GetString("message", szMessage, sizeof(szMessage));
         bool bIsTeamChat = jMessage.GetBool("is_team_chat");
         
-        // 构建聊天动作字符串: "时间|消息|是否队伍聊天"
+        // 构建聊天动作字符串
         char szChatAction[256];
         Format(szChatAction, sizeof(szChatAction), "%.3f|%s|%d", 
             fTime, szMessage, bIsTeamChat ? 1 : 0);
@@ -2079,26 +2271,28 @@ public Action CS_OnBuyCommand(int client, const char[] szWeapon)
     if (!IsValidClient(client) || !IsFakeClient(client))
         return Plugin_Continue;
     
-    // 1. 如果是插件发起的购买(通过DelayedBuy),允许通过
     if (g_bAllowPurchase[client])
     {
         g_bAllowPurchase[client] = false;
         return Plugin_Continue;
     }
     
-    // 2. 如果正在播放rec,拦截所有购买
     if (g_bPlayingRoundStartRec[client])
     {
         return Plugin_Handled;
     }
     
-    // 3. 其他情况允许通过（让bot_stuff处理）
     return Plugin_Continue;
 }
 
 // 加载购买动作
 bool LoadPurchaseActionsForBot(int client, int iRound)
 {
+    if (IsInWarmup())
+    {
+        return false;  
+    }
+
     // 加载bot专属demo的购买数据
     char szMap[64];
     GetCurrentMap(szMap, sizeof(szMap));
@@ -2124,19 +2318,15 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     }
     
     // 获取队伍信息
-    int iTeam = GetClientTeam(client);
+    int iClientTeam = GetClientTeam(client);
     char szTeamName[4];
     
-    if (iTeam == CS_TEAM_T)
+    if (iClientTeam == CS_TEAM_T)
         strcopy(szTeamName, sizeof(szTeamName), "T");
-    else if (iTeam == CS_TEAM_CT)
+    else if (iClientTeam == CS_TEAM_CT)
         strcopy(szTeamName, sizeof(szTeamName), "CT");
     else
         return false;
-    
-    // 获取bot名称
-    char szBotName[MAX_NAME_LENGTH];
-    GetClientName(client, szBotName, sizeof(szBotName));
     
     // 构建回合键
     char szRoundKey[32];
@@ -2153,11 +2343,11 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     }
     
     JSONObject jRound = view_as<JSONObject>(jUsePurchaseData.Get(szRoundKey));
-    if (!jRound.HasKey(szTeamName))
+    if (jRound == null || !jRound.HasKey(szTeamName))
     {
-        delete jRound;
+        if (jRound != null)
+            delete jRound;
         
-        // 清理临时数据
         if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
             delete jUsePurchaseData;
         
@@ -2165,14 +2355,22 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     }
     
     JSONObject jTeam = view_as<JSONObject>(jRound.Get(szTeamName));
+    if (jTeam == null)
+    {
+        delete jRound;
+        
+        if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+            delete jUsePurchaseData;
+        
+        return false;
+    }
     
-    // 使用rec文件名而不是索引
+    // 使用rec文件名作为bot的键
     if (g_szCurrentRecName[client][0] == '\0')
     {
         delete jTeam;
         delete jRound;
         
-        // 清理临时数据
         if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
             delete jUsePurchaseData;
         
@@ -2184,7 +2382,6 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
         delete jTeam;
         delete jRound;
         
-        // 清理临时数据
         if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
             delete jUsePurchaseData;
         
@@ -2192,25 +2389,47 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
     }
     
     JSONObject jBotData = view_as<JSONObject>(jTeam.Get(g_szCurrentRecName[client]));
+    if (jBotData == null)
+    {
+        delete jTeam;
+        delete jRound;
+        
+        if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+            delete jUsePurchaseData;
+        
+        return false;
+    }
     
     // 清理旧数据
     if (g_hPurchaseActions[client] != null)
         delete g_hPurchaseActions[client];
-    if (g_hFinalInventory[client] != null)
-        delete g_hFinalInventory[client];
+    if (g_hInitialInventory[client] != null)
+        delete g_hInitialInventory[client];
     
     g_hPurchaseActions[client] = new ArrayList(ByteCountToCells(128));
-    g_hFinalInventory[client] = new ArrayList(ByteCountToCells(64));
+    g_hInitialInventory[client] = new ArrayList(ByteCountToCells(64));
     g_iPurchaseActionIndex[client] = 0;
+    g_bInitialInventoryApplied[client] = false;
 
-    // 初始化丢弃数据
-    if (g_hDropActions[client] != null)
-        delete g_hDropActions[client];
-    g_hDropActions[client] = new ArrayList(ByteCountToCells(128));
-    g_iDropActionIndex[client] = 0;
-    
     int iPurchaseCount = 0;
-    int iDropCount = 0;
+    
+    // 加载初始装备
+    int iInitialCount = 0;
+    if (jBotData.HasKey("initial_inventory"))
+    {
+        JSONArray jInitial = view_as<JSONArray>(jBotData.Get("initial_inventory"));
+        
+        for (int i = 0; i < jInitial.Length; i++)
+        {
+            char szItem[64];
+            jInitial.GetString(i, szItem, sizeof(szItem));
+            g_hInitialInventory[client].PushString(szItem);
+            
+            iInitialCount++;
+        }
+        
+        delete jInitial;
+    }
     
     // 加载购买动作和丢弃动作
     if (jBotData.HasKey("purchases"))
@@ -2221,11 +2440,9 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
         {
             JSONObject jAction = view_as<JSONObject>(jPurchases.Get(i));
     
-            // 获取动作类型
             char szAction[32];
             jAction.GetString("action", szAction, sizeof(szAction));
             
-            // 处理购买动作
             if (StrEqual(szAction, "purchased", false))
             {
                 float fTime = jAction.GetFloat("time");
@@ -2233,25 +2450,17 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
                 jAction.GetString("item", szItem, sizeof(szItem));
                 jAction.GetString("slot", szSlot, sizeof(szSlot));
                 
+                if (IsDefaultPistol(szItem))
+                {
+                    delete jAction;
+                    continue;
+                }
+                
                 char szActionStr[128];
                 Format(szActionStr, sizeof(szActionStr), "%.1f|%s|%s", fTime, szItem, szSlot);
                 g_hPurchaseActions[client].PushString(szActionStr);
                 
                 iPurchaseCount++;
-            }
-            // 处理丢弃动作
-            else if (StrEqual(szAction, "dropped", false))
-            {
-                float fTime = jAction.GetFloat("time");
-                char szItem[64], szSlot[32];
-                jAction.GetString("item", szItem, sizeof(szItem));
-                jAction.GetString("slot", szSlot, sizeof(szSlot));
-                
-                char szDropStr[128];
-                Format(szDropStr, sizeof(szDropStr), "%.1f|%s|%s", fTime, szItem, szSlot);
-                g_hDropActions[client].PushString(szDropStr);
-                
-                iDropCount++;
             }
     
             delete jAction;
@@ -2260,70 +2469,99 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
         delete jPurchases;
     }
     
-    // 加载最终装备清单
-    int iInventoryCount = 0;
-    if (jBotData.HasKey("final_inventory"))
+    // 设置初始装备应用定时器
+    ConVar cvFreezeTime = FindConVar("mp_freezetime");
+    if (cvFreezeTime != null)
     {
-        JSONArray jInventory = view_as<JSONArray>(jBotData.Get("final_inventory"));
-        
-        for (int i = 0; i < jInventory.Length; i++)
+        // 如果有初始装备需要应用
+        if (g_hInitialInventory[client].Length > 0)
         {
-            char szItem[64];
-            jInventory.GetString(i, szItem, sizeof(szItem));
-            g_hFinalInventory[client].PushString(szItem);
+            // 找到purchases中第一个动作的时间和第一个丢弃时间
+            float fFirstActionTime = 9999.0;
+            float fFirstDropTime = 9999.0;
             
-            iInventoryCount++;
+            if (jBotData.HasKey("purchases"))
+            {
+                JSONArray jPurchases = view_as<JSONArray>(jBotData.Get("purchases"));
+                
+                for (int i = 0; i < jPurchases.Length; i++)
+                {
+                    JSONObject jAction = view_as<JSONObject>(jPurchases.Get(i));
+                    
+                    float fTime = jAction.GetFloat("time");
+                    char szAction[32];
+                    jAction.GetString("action", szAction, sizeof(szAction));
+                    
+                    if (StrEqual(szAction, "purchased", false) || StrEqual(szAction, "dropped", false))
+                    {
+                        if (fTime < fFirstActionTime)
+                            fFirstActionTime = fTime;
+                        
+                        if (StrEqual(szAction, "dropped", false) && fTime < fFirstDropTime)
+                            fFirstDropTime = fTime;
+                    }
+                    
+                    delete jAction;
+                }
+                
+                delete jPurchases;
+            }
+            
+            // 计算需要的时间
+            float fNeededTime = g_hInitialInventory[client].Length * 0.2;
+            
+            // 决定截止时间
+            float fDeadline;
+            if (fFirstDropTime < 9999.0)
+            {
+                // 如果有丢弃行为,必须在丢弃时间2秒前完成
+                fDeadline = fFirstDropTime - 2.0;
+            }
+            else
+            {
+                // 没有丢弃行为,在第一个动作前0.5秒完成即可
+                fDeadline = fFirstActionTime - 0.5;
+            }
+            
+            float fStartTime = fDeadline - fNeededTime;
+            
+            // 计算购买间隔
+            float fBuyInterval = 0.2;
+            
+            if (fStartTime < 0.1)
+            {
+                fStartTime = 0.1;  
+                
+                if (fDeadline > fStartTime)
+                {
+                    fBuyInterval = (fDeadline - fStartTime) / g_hInitialInventory[client].Length;
+                    if (fBuyInterval < 0.05)
+                        fBuyInterval = 0.05; 
+                }
+                else
+                {
+                    fBuyInterval = 0.05;
+                }
+            }
+            
+            DataPack pack = new DataPack();
+            pack.WriteCell(GetClientUserId(client));
+            pack.WriteFloat(fBuyInterval);  
+            CreateTimer(fStartTime, Timer_ApplyInitialInventory, pack);
         }
-        
-        delete jInventory;
     }
     
     delete jBotData;
     delete jTeam;
     delete jRound;
     
-    // 设置装备验证定时器
-    ConVar cvFreezeTime = FindConVar("mp_freezetime");
-    if (cvFreezeTime != null)
-    {
-        float fFreezeTime = cvFreezeTime.FloatValue;
-        
-        if (fFreezeTime > 3.0 && g_hFinalInventory[client].Length > 0)
-        {
-            float fVerifyDelay = g_fTeamVerifyDelay[iTeam];
-            
-            if (fVerifyDelay <= 0.0)
-            {
-                fVerifyDelay = fFreezeTime - 3.0;
-                if (fVerifyDelay < 0.1)
-                    fVerifyDelay = 0.1;
-            }
-            
-            fVerifyDelay += GetRandomFloat(0.0, 1.5);
-            
-            DataPack pack = new DataPack();
-            pack.WriteCell(GetClientUserId(client));
-            g_hVerifyTimer[client] = CreateTimer(fVerifyDelay, Timer_VerifyInventory, pack);
-        }
-    }
-
-    // 如果有丢弃动作且功能已启用，启动丢弃timer
-    if (iDropCount > 0 && g_cvEnableDrops.BoolValue) 
-    {
-        DataPack pack = new DataPack();
-        pack.WriteCell(GetClientUserId(client));
-        g_hDropTimer[client] = CreateTimer(0.1, Timer_ExecuteDropAction, pack, 
-            TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
-    }
-    
-    // 如果使用的是临时加载的数据，需要删除
     if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
     {
         delete jUsePurchaseData;
     }
     
-    return (iPurchaseCount > 0 || iDropCount > 0 || iInventoryCount > 0);
-}                
+    return (iPurchaseCount > 0 || iInitialCount > 0);
+}
 
 // 执行购买动作的定时器
 public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
@@ -2332,7 +2570,13 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
     int iUserId = pack.ReadCell();
     
     int client = GetClientOfUserId(iUserId);
-    if (!IsValidClient(client))
+    if (client <= 0 || client > MaxClients)
+    {
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    if (!IsValidClient(client) || !IsPlayerAlive(client) || !IsFakeClient(client))
     {
         g_hPurchaseTimer[client] = null;  
         delete pack;
@@ -2355,7 +2599,6 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
     
     bool bInBuyZone = !!GetEntProp(client, Prop_Send, "m_bInBuyZone");
     float fCurrentTime = GetGameTime() - g_fRecStartTime[client];
-    int iTeam = GetClientTeam(client);
     
     if (!bInBuyZone)
         return Plugin_Continue;
@@ -2383,23 +2626,21 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
         strcopy(szOriginalItem, sizeof(szOriginalItem), szParts[1]);
         strcopy(szSlot, sizeof(szSlot), szParts[2]);
         
-        // 检查是否应该跳过此购买
         if (ShouldSkipPurchase(client, szOriginalItem))
         {
             g_iPurchaseActionIndex[client]++;
             continue;
         }
         
-        // 转换对面阵营武器
         char szBuyItem[64];
-        bool bNeedConvert = GetTeamSpecificWeapon(szOriginalItem, iTeam, szBuyItem, sizeof(szBuyItem));
+        int iClientTeam = GetClientTeam(client);
+        bool bNeedConvert = GetTeamSpecificWeapon(szOriginalItem, iClientTeam, szBuyItem, sizeof(szBuyItem));
         
         if (!bNeedConvert)
         {
             strcopy(szBuyItem, sizeof(szBuyItem), szOriginalItem);
         }
         
-        // 执行购买
         g_bAllowPurchase[client] = true;
         
         FakeClientCommand(client, "buy %s", szBuyItem);
@@ -2408,7 +2649,6 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
         
         g_iPurchaseActionIndex[client]++;
         
-        // 每次timer触发只执行一个购买动作,然后等待下次触发
         break;
     }
     
@@ -2422,6 +2662,129 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
     return Plugin_Continue;
 }
 
+// 应用初始装备的定时器
+public Action Timer_ApplyInitialInventory(Handle hTimer, DataPack pack)
+{
+    pack.Reset();
+    int iUserId = pack.ReadCell();
+    float fBuyInterval = pack.ReadFloat();  
+    delete pack;
+    
+    int client = GetClientOfUserId(iUserId);
+    
+    if (!IsValidClient(client) || !IsPlayerAlive(client) || !IsFakeClient(client))
+        return Plugin_Stop;
+    
+    if (g_bInitialInventoryApplied[client])
+        return Plugin_Stop;
+    
+    if (g_hInitialInventory[client] == null || g_hInitialInventory[client].Length == 0)
+        return Plugin_Stop;
+    
+    bool bInBuyZone = !!GetEntProp(client, Prop_Send, "m_bInBuyZone");
+    if (!bInBuyZone)
+        return Plugin_Stop;
+    
+    int iClientTeam = GetClientTeam(client);
+    
+    ArrayList hCurrentInventory = new ArrayList(ByteCountToCells(64));
+    CollectCurrentInventory(client, hCurrentInventory);
+    
+    ArrayList hMissingItems = new ArrayList(ByteCountToCells(64));
+    
+    for (int i = 0; i < g_hInitialInventory[client].Length; i++)
+    {
+        char szRequiredItem[64];
+        g_hInitialInventory[client].GetString(i, szRequiredItem, sizeof(szRequiredItem));
+        
+        if (IsDefaultPistol(szRequiredItem))
+            continue;
+
+        bool bHasItem = IsItemInInventory(hCurrentInventory, szRequiredItem);
+        
+        if (!bHasItem)
+        {
+            char szBuyItem[64];
+            GetTeamSpecificWeapon(szRequiredItem, iClientTeam, szBuyItem, sizeof(szBuyItem));
+            
+            hMissingItems.PushString(szBuyItem);
+        }
+    }
+    
+    delete hCurrentInventory;
+    
+    // 如果没有缺少的装备
+    if (hMissingItems.Length == 0)
+    {
+        delete hMissingItems;
+        g_bInitialInventoryApplied[client] = true;
+        return Plugin_Stop;
+    }
+    
+    // 开始购买缺少的装备
+    DataPack buyPack = new DataPack();
+    buyPack.WriteCell(GetClientUserId(client));
+    buyPack.WriteCell(hMissingItems);  
+    buyPack.WriteCell(0); 
+    buyPack.WriteFloat(fBuyInterval);  
+    
+    CreateTimer(0.1, Timer_BuyInitialItems, buyPack, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+    
+    g_bInitialInventoryApplied[client] = true;
+    
+    return Plugin_Stop;
+}
+
+public Action Timer_BuyInitialItems(Handle hTimer, DataPack pack)
+{
+    pack.Reset();
+    int iUserId = pack.ReadCell();
+    ArrayList hMissingItems = pack.ReadCell();
+    int iCurrentIndex = pack.ReadCell();
+    float fBuyInterval = pack.ReadFloat();  // 读取购买间隔
+    
+    int client = GetClientOfUserId(iUserId);
+    
+    if (!IsValidClient(client) || !IsPlayerAlive(client))
+    {
+        delete hMissingItems;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    bool bInBuyZone = !!GetEntProp(client, Prop_Send, "m_bInBuyZone");
+    if (!bInBuyZone)
+    {
+        delete hMissingItems;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    // 如果已经买完所有物品
+    if (iCurrentIndex >= hMissingItems.Length)
+    {
+        delete hMissingItems;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    // 购买当前物品
+    char szItem[64];
+    hMissingItems.GetString(iCurrentIndex, szItem, sizeof(szItem));
+    
+    g_bAllowPurchase[client] = true;
+    FakeClientCommand(client, "buy %s", szItem);
+    CreateTimer(0.05, Timer_ResetPurchaseFlag, GetClientUserId(client));
+    
+    pack.Reset();
+    pack.WriteCell(iUserId);
+    pack.WriteCell(hMissingItems);
+    pack.WriteCell(iCurrentIndex + 1);
+    pack.WriteFloat(fBuyInterval);
+    
+    return Plugin_Continue;
+}
+
 public Action Timer_ResetPurchaseFlag(Handle hTimer, any iUserId)
 {
     int client = GetClientOfUserId(iUserId);
@@ -2431,85 +2794,28 @@ public Action Timer_ResetPurchaseFlag(Handle hTimer, any iUserId)
     return Plugin_Stop;
 }
 
-// 执行丢弃动作的定时器
-public Action Timer_ExecuteDropAction(Handle hTimer, DataPack pack)
-{
-    pack.Reset();
-    int iUserId = pack.ReadCell();
-    
-    int client = GetClientOfUserId(iUserId);
-    if (!IsValidClient(client))
-    {
-        g_hDropTimer[client] = null;  
-        delete pack;
-        return Plugin_Stop;
-    }
-    
-    if (!g_bPlayingRoundStartRec[client])
-    {
-        g_hDropTimer[client] = null;  
-        delete pack;
-        return Plugin_Stop;
-    }
-    
-    if (g_hDropActions[client] == null)
-    {
-        g_hDropTimer[client] = null;  
-        delete pack;
-        return Plugin_Stop;
-    }
-    
-    if (!IsPlayerAlive(client))
-        return Plugin_Continue;
-    
-    float fCurrentTime = GetGameTime() - g_fRecStartTime[client];
-    
-    while (g_iDropActionIndex[client] < g_hDropActions[client].Length)
-    {
-        char szAction[128];
-        g_hDropActions[client].GetString(g_iDropActionIndex[client], szAction, sizeof(szAction));
-        
-        char szParts[3][64];
-        int iParts = ExplodeString(szAction, "|", szParts, sizeof(szParts), sizeof(szParts[]));
-        
-        if (iParts < 3)
-        {
-            g_iDropActionIndex[client]++;
-            continue;
-        }
-        
-        float fActionTime = StringToFloat(szParts[0]);
-        
-        if (fCurrentTime < fActionTime)
-            break;
-        
-        char szItem[64];
-        strcopy(szItem, sizeof(szItem), szParts[1]);
-        
-        // 查找并丢弃物品
-        ExecuteDropAction(client, szItem);
-        
-        g_iDropActionIndex[client]++;
-    }
-    
-    if (g_iDropActionIndex[client] >= g_hDropActions[client].Length)
-    {
-        g_hDropTimer[client] = null;  
-        delete pack;
-        return Plugin_Stop;
-    }
-    
-    return Plugin_Continue;
-}
-
-//聊天计时器
+// 聊天计时器
 public Action Timer_ExecuteChatAction(Handle hTimer, DataPack pack)
 {
     pack.Reset();
     int iUserId = pack.ReadCell();
     
     int client = GetClientOfUserId(iUserId);
+    if (client <= 0 || client > MaxClients)
+    {
+        delete pack;
+        return Plugin_Stop;
+    }
+    
     if (!IsValidClient(client))
+    {
+        g_hChatTimer[client] = null;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    // 热身期间停止聊天timer
+    if (IsInWarmup())
     {
         g_hChatTimer[client] = null;
         delete pack;
@@ -2558,7 +2864,6 @@ public Action Timer_ExecuteChatAction(Handle hTimer, DataPack pack)
         strcopy(szMessage, sizeof(szMessage), szParts[1]);
         bool bIsTeamChat = (StringToInt(szParts[2]) == 1);
         
-        // 执行聊天
         if (bIsTeamChat)
         {
             FakeClientCommand(client, "say_team %s", szMessage);
@@ -2590,7 +2895,6 @@ public Action Timer_CheckBombCarrier(Handle hTimer)
 {
     g_hBombCarrierCheckTimer = null;
     
-    // 查找带包的T
     int iBombCarrier = -1;
     
     for (int i = 1; i <= MaxClients; i++)
@@ -2601,7 +2905,6 @@ public Action Timer_CheckBombCarrier(Handle hTimer)
         if (GetClientTeam(i) != CS_TEAM_T)
             continue;
         
-        // 检查是否带C4
         int iC4 = GetPlayerWeaponSlot(i, CS_SLOT_C4);
         if (IsValidEntity(iC4))
         {
@@ -2621,7 +2924,6 @@ public Action Timer_CheckBombCarrier(Handle hTimer)
         return Plugin_Stop;
     }
     
-    // 如果带包T正在播放REC，停止它
     if (g_bPlayingRoundStartRec[iBombCarrier] && BotMimic_IsPlayerMimicing(iBombCarrier))
     {
         BotMimic_StopPlayerMimic(iBombCarrier);
@@ -2631,264 +2933,9 @@ public Action Timer_CheckBombCarrier(Handle hTimer)
     return Plugin_Stop;
 }
 
-// 执行丢弃操作
-void ExecuteDropAction(int client, const char[] szItem)
-{
-    // 查找物品所在槽位
-    int iWeaponEntity = -1;
-    char szWeaponClass[64];
-    Format(szWeaponClass, sizeof(szWeaponClass), "weapon_%s", szItem);
-    
-    // 检查所有槽位
-    for (int slot = 0; slot <= 4; slot++)
-    {
-        int iWeapon = GetPlayerWeaponSlot(client, slot);
-        if (IsValidEntity(iWeapon))
-        {
-            char szClass[64];
-            GetEntityClassname(iWeapon, szClass, sizeof(szClass));
-            
-            if (StrEqual(szClass, szWeaponClass, false))
-            {
-                iWeaponEntity = iWeapon;
-                break;
-            }
-        }
-    }
-    
-    if (iWeaponEntity == -1)
-    {
-        return;
-    }
-    
-    // 执行丢弃
-    SDKHooks_DropWeapon(client, iWeaponEntity);
-}
-
-// 验证装备完整性
-public Action Timer_VerifyInventory(Handle hTimer, DataPack pack)
-{
-    pack.Reset();
-    int iUserId = pack.ReadCell();
-    delete pack;
-    
-    int client = GetClientOfUserId(iUserId);
-    
-    // 先清空 timer 句柄,避免重复 Kill
-    g_hVerifyTimer[client] = null;
-    
-    if (!IsValidClient(client))
-    {
-        return Plugin_Stop;
-    }
-    
-    if (g_bInventoryVerified[client])
-    {
-        return Plugin_Stop;
-    }
-    
-    if (g_hFinalInventory[client] == null)
-    {
-        return Plugin_Stop;
-    }
-    
-    int iTeam = GetClientTeam(client);
-    
-    // 收集当前装备
-    ArrayList hCurrentInventory = new ArrayList(ByteCountToCells(64));
-    CollectCurrentInventory(client, hCurrentInventory);
-    
-    // 验证其他装备
-    int iMissingCount = 0;
-    for (int i = 0; i < g_hFinalInventory[client].Length; i++)
-    {
-        char szRequiredItem[64];
-        g_hFinalInventory[client].GetString(i, szRequiredItem, sizeof(szRequiredItem));
-        
-        // 忽略默认手枪
-        if (IsDefaultPistol(szRequiredItem))
-            continue;
-        
-        // 检查是否应该跳过
-        if (ShouldSkipPurchase(client, szRequiredItem))
-            continue;
-        
-        bool bHasItem = IsItemInInventory(hCurrentInventory, szRequiredItem);
-        
-        if (!bHasItem)
-        {
-            // 转换对面阵营武器
-            char szBuyItem[64];
-            GetTeamSpecificWeapon(szRequiredItem, iTeam, szBuyItem, sizeof(szBuyItem));
-            
-            // 尝试购买,如果失败则降级
-            BuyItemWithFallback(client, szBuyItem, 0.2 * iMissingCount);
-            iMissingCount++;
-        }
-    }
-    
-    delete hCurrentInventory;
-    
-    g_bInventoryVerified[client] = true;
-    
-    return Plugin_Stop;
-}
-
-// 带降级机制的购买函数
-void BuyItemWithFallback(int client, const char[] szItem, float fDelay)
-{
-    if (IsDefaultPistol(szItem))
-        return;
-    
-    DataPack pack = new DataPack();
-    pack.WriteCell(GetClientUserId(client));
-    pack.WriteString(szItem);
-    
-    CreateTimer(fDelay, Timer_BuyItemWithFallback, pack);
-}
-
-public Action Timer_BuyItemWithFallback(Handle hTimer, DataPack pack)
-{
-    pack.Reset();
-    int iUserId = pack.ReadCell();
-    
-    char szItem[64];
-    pack.ReadString(szItem, sizeof(szItem));
-    delete pack;
-    
-    int client = GetClientOfUserId(iUserId);
-    
-    if (!IsValidClient(client) || !IsPlayerAlive(client))
-        return Plugin_Stop;
-    
-    bool bInBuyZone = !!GetEntProp(client, Prop_Send, "m_bInBuyZone");
-    
-    if (!bInBuyZone)
-        return Plugin_Stop;
-    
-    int iMoney = GetEntProp(client, Prop_Send, "m_iAccount");
-    int iPrice = GetItemPrice(szItem);
-    
-    // 如果买得起,直接购买
-    if (iMoney >= iPrice)
-    {
-        g_bAllowPurchase[client] = true;
-        FakeClientCommand(client, "buy %s", szItem);
-        CreateTimer(0.05, Timer_ResetPurchaseFlag, GetClientUserId(client));
-        
-        return Plugin_Stop;
-    }
-    
-    // 买不起,尝试降级
-    char szFallback[64];
-    if (GetFallbackWeapon(szItem, iMoney, szFallback, sizeof(szFallback)))
-    {
-        g_bAllowPurchase[client] = true;
-        FakeClientCommand(client, "buy %s", szFallback);
-        CreateTimer(0.05, Timer_ResetPurchaseFlag, GetClientUserId(client));
-    }
-    
-    return Plugin_Stop;
-}
-
-// 获取降级武器
-bool GetFallbackWeapon(const char[] szItem, int iMoney, char[] szFallback, int iMaxLen)
-{
-    // 狙击枪降级链: AWP -> SSG08
-    if (StrEqual(szItem, "awp", false))
-    {
-        if (iMoney >= 1700) { strcopy(szFallback, iMaxLen, "ssg08"); return true; }
-    }
-    else if (StrEqual(szItem, "scar20", false))
-    {
-        if (iMoney >= 4750) { strcopy(szFallback, iMaxLen, "awp"); return true; }
-        if (iMoney >= 1700) { strcopy(szFallback, iMaxLen, "ssg08"); return true; }
-    }
-    else if (StrEqual(szItem, "g3sg1", false))
-    {
-        if (iMoney >= 4750) { strcopy(szFallback, iMaxLen, "awp"); return true; }
-        if (iMoney >= 1700) { strcopy(szFallback, iMaxLen, "ssg08"); return true; }
-    }
-    
-    // 步枪降级链: AK47/M4 -> FAMAS/Galil -> MAC10/MP9 
-    if (StrEqual(szItem, "ak47", false))
-    {
-        if (iMoney >= 2000) { strcopy(szFallback, iMaxLen, "galilar"); return true; }
-        if (iMoney >= 1050) { strcopy(szFallback, iMaxLen, "mac10"); return true; }
-    }
-    else if (StrEqual(szItem, "m4a1", false) || StrEqual(szItem, "m4a1_silencer", false))
-    {
-        if (iMoney >= 2250) { strcopy(szFallback, iMaxLen, "famas"); return true; }
-        if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
-    }
-    else if (StrEqual(szItem, "aug", false))
-    {
-        if (iMoney >= 3100) { strcopy(szFallback, iMaxLen, "m4a1"); return true; }
-        if (iMoney >= 2250) { strcopy(szFallback, iMaxLen, "famas"); return true; }
-        if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
-    }
-    else if (StrEqual(szItem, "sg556", false))
-    {
-        if (iMoney >= 2700) { strcopy(szFallback, iMaxLen, "ak47"); return true; }
-        if (iMoney >= 2000) { strcopy(szFallback, iMaxLen, "galilar"); return true; }
-        if (iMoney >= 1050) { strcopy(szFallback, iMaxLen, "mac10"); return true; }
-    }
-    else if (StrEqual(szItem, "famas", false))
-    {
-        if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
-    }
-    else if (StrEqual(szItem, "galilar", false))
-    {
-        if (iMoney >= 1050) { strcopy(szFallback, iMaxLen, "mac10"); return true; }
-    }
-    
-    // SMG降级链
-    if (StrEqual(szItem, "p90", false))
-    {
-        if (iMoney >= 1500) { strcopy(szFallback, iMaxLen, "mp7"); return true; }
-        if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
-    }
-    else if (StrEqual(szItem, "mp7", false))
-    {
-        if (iMoney >= 1250) { strcopy(szFallback, iMaxLen, "mp9"); return true; }
-    }
-    
-    // 护甲降级: vesthelm -> vest
-    if (StrEqual(szItem, "vesthelm", false))
-    {
-        if (iMoney >= 650) { strcopy(szFallback, iMaxLen, "vest"); return true; }
-    }
-    
-    return false;
-}
-
-public Action Timer_BuyMissingItem(Handle hTimer, DataPack pack)
-{
-    pack.Reset();
-    int iUserId = pack.ReadCell();
-    
-    char szItem[64];
-    pack.ReadString(szItem, sizeof(szItem));
-    delete pack;
-    
-    int client = GetClientOfUserId(iUserId);
-    
-    bool bInBuyZone = !!GetEntProp(client, Prop_Send, "m_bInBuyZone");
-    
-    if (!bInBuyZone)
-        return Plugin_Stop;
-    
-    g_bAllowPurchase[client] = true;
-    FakeClientCommand(client, "buy %s", szItem);
-    CreateTimer(0.05, Timer_ResetPurchaseFlag, GetClientUserId(client));
-    
-    return Plugin_Stop;
-}
-
 // 收集当前装备
 void CollectCurrentInventory(int client, ArrayList hInventory)
 {
-    // 主武器
     int iPrimary = GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY);
     if (IsValidEntity(iPrimary))
     {
@@ -2898,7 +2945,6 @@ void CollectCurrentInventory(int client, ArrayList hInventory)
         hInventory.PushString(szClass);
     }
     
-    // 副武器
     int iSecondary = GetPlayerWeaponSlot(client, CS_SLOT_SECONDARY);
     if (IsValidEntity(iSecondary))
     {
@@ -2908,7 +2954,6 @@ void CollectCurrentInventory(int client, ArrayList hInventory)
         hInventory.PushString(szClass);
     }
     
-    // 检查所有手雷
     for (int slot = CS_SLOT_GRENADE; slot <= CS_SLOT_C4; slot++)
     {
         int iWeapon = GetPlayerWeaponSlot(client, slot);
@@ -2921,7 +2966,6 @@ void CollectCurrentInventory(int client, ArrayList hInventory)
         }
     }
     
-    // 护甲
     int iArmor = GetEntProp(client, Prop_Send, "m_ArmorValue");
     bool bHasHelmet = !!GetEntProp(client, Prop_Send, "m_bHasHelmet");
     
@@ -2933,7 +2977,6 @@ void CollectCurrentInventory(int client, ArrayList hInventory)
             hInventory.PushString("vest");
     }
     
-    // 拆弹器
     if (GetClientTeam(client) == CS_TEAM_CT)
     {
         bool bHasDefuser = !!GetEntProp(client, Prop_Send, "m_bHasDefuser");
@@ -2977,7 +3020,7 @@ bool ShouldSkipPurchase(int client, const char[] szItem)
 {
     int iSlot = GetWeaponSlotFromItem(szItem);
     
-    if (iSlot == -1)
+    if (iSlot < 0 || iSlot > CS_SLOT_C4)
         return false;
     
     int iExistingWeapon = GetPlayerWeaponSlot(client, iSlot);
@@ -2992,7 +3035,7 @@ bool ShouldSkipPurchase(int client, const char[] szItem)
     if (iSlot == CS_SLOT_SECONDARY)
         return false;
     
-    // 主手:如果要购买狙击枪
+    // 主武器的狙击枪特殊处理
     if (iSlot == CS_SLOT_PRIMARY && IsSniperWeapon(szItem))
     {
         if (IsSniperWeapon(szExistingClass))
@@ -3000,13 +3043,11 @@ bool ShouldSkipPurchase(int client, const char[] szItem)
         return false;
     }
     
-    // 主手:如果当前持有狙击枪,要购买的不是狙击枪
     if (iSlot == CS_SLOT_PRIMARY && IsSniperWeapon(szExistingClass) && !IsSniperWeapon(szItem))
     {
         return true;
     }
     
-    // 主手:如果已有非默认武器,跳过
     if (iSlot == CS_SLOT_PRIMARY)
         return true;
     
@@ -3124,25 +3165,25 @@ public Action Command_ShowStatus(int client, int args)
 
 bool ShouldStopFromDamage(int iDamage, int iDamageType)
 {
-    // 伤害太小，忽略（5点以下）
+    // 忽略低伤害
     if (iDamage < 5)
     {
         return false;
     }
     
-    // 摔落伤害 - 不停止（已经在OnTakeDamage中阻止了）
+    // 不停止摔伤
     if (iDamageType & DMG_FALL)
     {
         return false;
     }
     
-    // 手雷伤害 - 不停止
+    // 不停止手雷
     if (iDamageType & DMG_BLAST)
     {
         return false;
     }
     
-    // 燃烧伤害（火瓶/燃烧弹）- 5点以上才停止
+    // 燃烧伤害5点以上才停止
     if (iDamageType & DMG_BURN)
     {
         if (iDamage < 5)
@@ -3152,13 +3193,13 @@ bool ShouldStopFromDamage(int iDamage, int iDamageType)
         return true;
     }
     
-    // 子弹伤害（直接攻击）- 必须停止
+    // 停止子弹伤害
     if (iDamageType & DMG_BULLET)
     {
         return true;
     }
     
-    // 其他直接伤害 - 必须停止
+    // 停止其他伤害
     return true;
 }
 
@@ -3168,7 +3209,6 @@ bool ShouldStopFromDamage(int iDamage, int iDamageType)
 
 bool IsPistolRound(int iRound)
 {
-    // round1(iRound=0) 和 round16(iRound=15) 是手枪局
     return (iRound == 0 || iRound == 15);
 }
 
@@ -3206,11 +3246,7 @@ void GetUseDemoFolder(int client, char[] szOutput, int iMaxLen)
 void CleanupClientTimers(int client)
 {
     // 清理购买timer
-    if (g_hPurchaseTimer[client] != null)
-    {
-        KillTimer(g_hPurchaseTimer[client]);
-        g_hPurchaseTimer[client] = null;
-    }
+    KillClientTimer(g_hPurchaseTimer[client]);
     
     if (g_hPurchaseActions[client] != null)
     {
@@ -3219,39 +3255,8 @@ void CleanupClientTimers(int client)
     }
     g_iPurchaseActionIndex[client] = 0;
     
-    // 清理验证timer
-    if (g_hVerifyTimer[client] != null)
-    {
-        KillTimer(g_hVerifyTimer[client]);
-        g_hVerifyTimer[client] = null;
-    }
-    
-    if (g_hFinalInventory[client] != null)
-    {
-        delete g_hFinalInventory[client];
-        g_hFinalInventory[client] = null;
-    }
-    
-    // 清理丢弃timer
-    if (g_hDropTimer[client] != null)
-    {
-        KillTimer(g_hDropTimer[client]);
-        g_hDropTimer[client] = null;
-    }
-    
-    if (g_hDropActions[client] != null)
-    {
-        delete g_hDropActions[client];
-        g_hDropActions[client] = null;
-    }
-    g_iDropActionIndex[client] = 0;
-    
     // 清理聊天timer
-    if (g_hChatTimer[client] != null)
-    {
-        KillTimer(g_hChatTimer[client]);
-        g_hChatTimer[client] = null;
-    }
+    KillClientTimer(g_hChatTimer[client]);
     
     if (g_hChatActions[client] != null)
     {
@@ -3259,9 +3264,37 @@ void CleanupClientTimers(int client)
         g_hChatActions[client] = null;
     }
     g_iChatActionIndex[client] = 0;
+
+    KillClientTimer(g_hVoiceTimer[client]);
+    
+    // 停止语音
+    if (BotVoice_IsSpeaking(client))
+    {
+        BotVoice_StopSpeaking(client);
+    }
+    
+    if (g_hVoiceActions[client] != null)
+    {
+        delete g_hVoiceActions[client];
+        g_hVoiceActions[client] = null;
+    }
+    g_iVoiceActionIndex[client] = 0;
+    
+    if (g_hVoiceFiles[client] != null)
+    {
+        delete g_hVoiceFiles[client];
+        g_hVoiceFiles[client] = null;
+    }
     
     g_bAllowPurchase[client] = false;
-    g_bInventoryVerified[client] = false;
+
+    if (g_hInitialInventory[client] != null)
+    {
+        delete g_hInitialInventory[client];
+        g_hInitialInventory[client] = null;
+    }
+    
+    g_bInitialInventoryApplied[client] = false;
 }
 
 /**
@@ -3272,6 +3305,9 @@ void CleanupClientTimers(int client)
  */
 void StopTeamBotsRec(int iTeam, bool bCheckBalance = false)
 {
+    if (iTeam != 0 && (iTeam < 0 || iTeam >= 4))
+        return;
+    
     // 如果需要检查人数平衡
     if (bCheckBalance && iTeam == CS_TEAM_CT)
     {
@@ -3291,7 +3327,6 @@ void StopTeamBotsRec(int iTeam, bool bCheckBalance = false)
         if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
             continue;
         
-        // 如果指定了队伍，只停止该队伍
         if (iTeam != 0 && GetClientTeam(i) != iTeam)
             continue;
         
@@ -3300,6 +3335,18 @@ void StopTeamBotsRec(int iTeam, bool bCheckBalance = false)
             BotMimic_StopPlayerMimic(i);
             g_bPlayingRoundStartRec[i] = false;
         }
+    }
+}
+
+/**
+ * 统一Timer清理函数
+ */
+void KillClientTimer(Handle &hTimer)
+{
+    if (hTimer != null)
+    {
+        KillTimer(hTimer);
+        hTimer = null;
     }
 }
 
@@ -3320,6 +3367,7 @@ void ResetClientData(int client)
 
     BotShared_ResetBotState(client);    
 }
+
 
 bool IsValidClient(int client)
 {
@@ -3347,27 +3395,13 @@ int GetAliveTeamCount(int iTeam)
 
 int GetWeaponSlotFromItem(const char[] szItem)
 {
-    // 主武器
-    if (StrEqual(szItem, "ak47", false) || StrEqual(szItem, "m4a1", false) ||
-        StrEqual(szItem, "m4a1_silencer", false) || StrEqual(szItem, "awp", false) ||
-        StrEqual(szItem, "famas", false) || StrEqual(szItem, "galilar", false) ||
-        StrEqual(szItem, "ssg08", false) || StrEqual(szItem, "aug", false) ||
-        StrEqual(szItem, "sg556", false) || StrEqual(szItem, "mp9", false) ||
-        StrEqual(szItem, "mac10", false) || StrEqual(szItem, "ump45", false) ||
-        StrEqual(szItem, "p90", false) || StrEqual(szItem, "bizon", false) ||
-        StrEqual(szItem, "mp7", false) || StrEqual(szItem, "scar20", false) ||
-        StrEqual(szItem, "g3sg1", false) || StrEqual(szItem, "nova", false) ||
-        StrEqual(szItem, "xm1014", false) || StrEqual(szItem, "mag7", false) ||
-        StrEqual(szItem, "sawedoff", false) || StrEqual(szItem, "m249", false) ||
-        StrEqual(szItem, "negev", false))
-        return CS_SLOT_PRIMARY;
+    int type;
+    if (!g_hWeaponTypes.GetValue(szItem, type))
+        return -1;
     
-    // 副武器
-    if (StrEqual(szItem, "deagle", false) || StrEqual(szItem, "usp_silencer", false) ||
-        StrEqual(szItem, "glock", false) || StrEqual(szItem, "hkp2000", false) ||
-        StrEqual(szItem, "p250", false) || StrEqual(szItem, "tec9", false) ||
-        StrEqual(szItem, "fiveseven", false) || StrEqual(szItem, "cz75a", false) ||
-        StrEqual(szItem, "elite", false) || StrEqual(szItem, "revolver", false))
+    if (type & (WEAPON_TYPE_RIFLE | WEAPON_TYPE_SNIPER | WEAPON_TYPE_SMG))
+        return CS_SLOT_PRIMARY;
+    if (type & WEAPON_TYPE_DEFAULT_PISTOL)
         return CS_SLOT_SECONDARY;
     
     return -1;
@@ -3386,102 +3420,6 @@ public int Sort_BotsByMoney(int index1, int index2, Handle array, Handle hndl)
     if (iMoney1 < iMoney2) return -1;
     if (iMoney1 > iMoney2) return 1;
     return 0;
-}
-
-// 为指定demo加载freeze时间
-bool LoadFreezeTimesForDemo(const char[] szMap, const char[] szDemoFolder, float fFreezeTimes[31], bool bValid[31])
-{
-    char szFreezePath[PLATFORM_MAX_PATH];
-    BuildPath(Path_SM, szFreezePath, sizeof(szFreezePath), 
-        "data/botmimic/all/%s/%s/freeze.txt", szMap, szDemoFolder);
-    
-    // 初始化为无效
-    for (int i = 0; i < 31; i++)
-    {
-        bValid[i] = false;
-        fFreezeTimes[i] = 0.0;
-    }
-    
-    if (!FileExists(szFreezePath))
-        return false;
-    
-    File hFile = OpenFile(szFreezePath, "r");
-    if (hFile == null)
-        return false;
-    
-    char szLine[128];
-    float fStandard = 20.0;
-    const float TOLERANCE = 2.0;
-    int iValidCount = 0;
-    
-    while (hFile.ReadLine(szLine, sizeof(szLine)))
-    {
-        TrimString(szLine);
-        
-        if (strlen(szLine) == 0 || szLine[0] == '/' || szLine[0] == '#')
-            continue;
-        
-        // 检查标准时间
-        if (StrContains(szLine, "冻结时间", false) != -1 || 
-            StrContains(szLine, "standard", false) != -1 ||
-            StrContains(szLine, "freeze", false) != -1)
-        {
-            char szParts[2][64];
-            int iParts = ExplodeString(szLine, ":", szParts, sizeof(szParts), sizeof(szParts[]));
-            if (iParts >= 2)
-            {
-                TrimString(szParts[1]);
-                ReplaceString(szParts[1], sizeof(szParts[]), "秒", "");
-                ReplaceString(szParts[1], sizeof(szParts[]), "s", "", false);
-                fStandard = StringToFloat(szParts[1]);
-            }
-            continue;
-        }
-        
-        // 解析回合时间
-        char szParts[2][64];
-        int iParts = ExplodeString(szLine, ":", szParts, sizeof(szParts), sizeof(szParts[]));
-        if (iParts < 2)
-            continue;
-        
-        TrimString(szParts[0]);
-        int iRoundNum = -1;
-        
-        if (StrContains(szParts[0], "round", false) != -1)
-        {
-            ReplaceString(szParts[0], sizeof(szParts[]), "round", "", false);
-            ReplaceString(szParts[0], sizeof(szParts[]), "Round", "", false);
-            TrimString(szParts[0]);
-            iRoundNum = StringToInt(szParts[0]);
-        }
-        else
-        {
-            iRoundNum = StringToInt(szParts[0]);
-        }
-        
-        if (iRoundNum < 1 || iRoundNum > 30)
-            continue;
-        
-        TrimString(szParts[1]);
-        ReplaceString(szParts[1], sizeof(szParts[]), "秒", "");
-        ReplaceString(szParts[1], sizeof(szParts[]), "s", "", false);
-        float fFreezeTime = StringToFloat(szParts[1]);
-        
-        // 数组索引 = 回合号 - 1
-        int iArrayIndex = iRoundNum - 1;
-        
-        // 经济系统用，需要tolerance检查
-        float fDifference = FloatAbs(fFreezeTime - fStandard);
-        if (fDifference <= TOLERANCE)
-        {
-            bValid[iArrayIndex] = true;
-            fFreezeTimes[iArrayIndex] = fFreezeTime;
-            iValidCount++;
-        }
-    }
-    
-    delete hFile;
-    return (iValidCount > 0);
 }
 
 // 为指定demo加载购买数据
@@ -3559,21 +3497,10 @@ public Action Command_SelectDemo(int client, int args)
         return Plugin_Handled;
     }
     
-    // 设置demo
     strcopy(g_szCurrentRecFolder, sizeof(g_szCurrentRecFolder), szDemoFolder);
     g_bRecFolderSelected = true;
-    
-    // 加载freeze时间
-    if (LoadFreezeTimes(szMap, g_szCurrentRecFolder))
-    {
-        ReplyToCommand(client, "[Bot REC] Loaded freeze times for '%s'", szDemoFolder);
-    }
-    
-    // 加载购买数据
-    if (LoadPurchaseDataFile(g_szCurrentRecFolder))
-    {
-        ReplyToCommand(client, "[Bot REC] Loaded purchase data for '%s'", szDemoFolder);
-    }
+
+    LoadAllDemoData(szMap, g_szCurrentRecFolder);
     
     ReplyToCommand(client, "[Bot REC] Demo folder set to: %s", szDemoFolder);
     ReplyToCommand(client, "[Bot REC] Use 'mp_restartgame 1' to apply changes");
@@ -3582,495 +3509,67 @@ public Action Command_SelectDemo(int client, int args)
 }
 
 // ============================================================================
-// REC分配模拟/执行函数
+// 辅助函数 为一个队伍分配REC
 // ============================================================================
-KnapsackResult SolveKnapsackDP(ArrayList hBots, ArrayList hRecInfoList, int iTotalBudget)
+
+// 为一个队伍分配REC
+bool TryAssignRecsToTeamWithCost(ArrayList hBots, ArrayList hRecInfoList, 
+                                  int assignment[MAXPLAYERS+1], 
+                                  int &totalValue, int &totalCost)
 {
-    KnapsackResult result;
-    result.isValid = false;
-    result.totalValue = 0;
-    result.totalCost = 0;
-    
-    for (int i = 0; i <= MAXPLAYERS; i++)
-        result.assignment[i] = -1;
-    
     int iBotCount = hBots.Length;
-    int iRecCount = hRecInfoList.Length;
-    
-    if (iBotCount == 0 || iRecCount == 0)
-        return result;
-    
-    int iMaxBudget = iTotalBudget;
-    if (iMaxBudget > 80000)
-        iMaxBudget = 80000;
-    
-    int iBudgetStep = 100;
-    int iBudgetSize = (iMaxBudget / iBudgetStep) + 1;
-    
-    // 使用 ArrayList 代替多维数组
-    ArrayList dpTable = new ArrayList(iBudgetSize);
-    ArrayList choiceTable = new ArrayList(iBudgetSize);
-    ArrayList usedRecsTable = new ArrayList(iBudgetSize);
-    
-    // 初始化表格 所有状态设为0 
-    for (int i = 0; i <= iBotCount; i++)
-    {
-        ArrayList dpRow = new ArrayList();
-        ArrayList choiceRow = new ArrayList();
-        ArrayList usedRecsRow = new ArrayList(iBudgetSize);
-        
-        for (int b = 0; b < iBudgetSize; b++)
-        {
-            dpRow.Push(0);
-            choiceRow.Push(-1);
-            
-            ArrayList usedRecs = new ArrayList();
-            usedRecsRow.Push(usedRecs);
-        }
-        
-        dpTable.Push(dpRow);
-        choiceTable.Push(choiceRow);
-        usedRecsTable.Push(usedRecsRow);
-    }
-    
-    // DP填表逻辑 
-    for (int i = 1; i <= iBotCount; i++)
-    {       
-        ArrayList currentDp = view_as<ArrayList>(dpTable.Get(i));
-        ArrayList currentChoice = view_as<ArrayList>(choiceTable.Get(i));
-        ArrayList currentUsedRecs = view_as<ArrayList>(usedRecsTable.Get(i));
-        ArrayList prevDp = view_as<ArrayList>(dpTable.Get(i - 1));
-        ArrayList prevUsedRecs = view_as<ArrayList>(usedRecsTable.Get(i - 1));
-        
-        for (int b = 0; b < iBudgetSize; b++)
-        {
-            int budget = b * iBudgetStep;
-            
-            // 先继承上一行的值 
-            int inheritValue = prevDp.Get(b);
-            currentDp.Set(b, inheritValue);
-            
-            // 复制上一行的已使用REC列表
-            ArrayList inheritUsedList = view_as<ArrayList>(prevUsedRecs.Get(b));
-            ArrayList currentUsedList = view_as<ArrayList>(currentUsedRecs.Get(b));
-            delete currentUsedList;
-            
-            currentUsedList = new ArrayList();
-            for (int u = 0; u < inheritUsedList.Length; u++)
-            {
-                currentUsedList.Push(inheritUsedList.Get(u));
-            }
-            currentUsedRecs.Set(b, currentUsedList);
-            
-            // 尝试为当前bot分配每个REC
-            for (int r = 0; r < iRecCount; r++)
-            {
-                RecEquipmentInfo recInfo;
-                hRecInfoList.GetArray(r, recInfo, sizeof(RecEquipmentInfo));
-                
-                int cost = recInfo.totalCost;
-                int value = recInfo.tacticalValue;
-                
-                int prevBudgetIndex = (budget - cost) / iBudgetStep;
-                
-                if (budget >= cost && prevBudgetIndex >= 0 && prevBudgetIndex < iBudgetSize)
-                {
-                    int prevValue = prevDp.Get(prevBudgetIndex);
-                    
-                    // 检查该REC是否已被使用
-                    ArrayList prevUsedList = view_as<ArrayList>(prevUsedRecs.Get(prevBudgetIndex));
-                    bool bRecAlreadyUsed = (prevUsedList.FindValue(r) != -1);
-                    
-                    if (!bRecAlreadyUsed)
-                    {
-                        int newValue = prevValue + value;
-                        int currentValue = currentDp.Get(b);
-                        
-                        if (newValue > currentValue)
-                        {
-                            currentDp.Set(b, newValue);
-                            currentChoice.Set(b, r);
-                            
-                            // 更新已使用REC列表
-                            ArrayList newUsedList = view_as<ArrayList>(currentUsedRecs.Get(b));
-                            delete newUsedList;
-                            
-                            newUsedList = new ArrayList();
-                            for (int u = 0; u < prevUsedList.Length; u++)
-                            {
-                                newUsedList.Push(prevUsedList.Get(u));
-                            }
-                            newUsedList.Push(r);
-                            
-                            currentUsedRecs.Set(b, newUsedList);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // 找最优解
-    int bestBudgetIndex = -1;
-    int bestValue = 0;  
-    ArrayList lastDp = view_as<ArrayList>(dpTable.Get(iBotCount));
-    
-    for (int b = 0; b < iBudgetSize; b++)
-    {
-        int budget = b * iBudgetStep;
-        int value = lastDp.Get(b);
-        
-        if (budget <= iTotalBudget && value > bestValue)
-        {
-            bestValue = value;
-            bestBudgetIndex = b;
-        }
-    }
-    
-    // 只要有价值就算有效 
-    if (bestBudgetIndex == -1 || bestValue <= 0)
-    {    
-        // 清理
-        for (int i = 0; i <= iBotCount; i++)
-        {
-            delete view_as<ArrayList>(dpTable.Get(i));
-            delete view_as<ArrayList>(choiceTable.Get(i));
-            
-            ArrayList usedRecsRow = view_as<ArrayList>(usedRecsTable.Get(i));
-            for (int b = 0; b < iBudgetSize; b++)
-            {
-                delete view_as<ArrayList>(usedRecsRow.Get(b));
-            }
-            delete usedRecsRow;
-        }
-        delete dpTable;
-        delete choiceTable;
-        delete usedRecsTable;
-        
-        return result;
-    }
-    
-    // 回溯解
-    int currentBudgetIndex = bestBudgetIndex;
-    int totalCost = 0;
     ArrayList usedRecIndices = new ArrayList();
+    totalValue = 0;
+    totalCost = 0;
     
-    for (int i = iBotCount; i >= 1; i--)
+    // 从钱最少的Bot开始分配
+    for (int b = 0; b < iBotCount; b++)
     {
-        ArrayList currentChoice = view_as<ArrayList>(choiceTable.Get(i));
-        int recIndex = currentChoice.Get(currentBudgetIndex);
-        result.assignment[i - 1] = recIndex;
-        
-        if (recIndex >= 0)
-        {
-            usedRecIndices.Push(recIndex);
-            
-            RecEquipmentInfo recInfo;
-            hRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
-            
-            int cost = recInfo.totalCost;
-            totalCost += cost;
-            
-            int prevBudget = (currentBudgetIndex * iBudgetStep) - cost;
-            currentBudgetIndex = prevBudget / iBudgetStep;
-        }
-    }
-    
-    delete usedRecIndices;
-    
-    // 标记为有效并设置结果
-    result.isValid = true;
-    result.totalValue = bestValue;
-    result.totalCost = totalCost;
-    
-    // 清理
-    for (int i = 0; i <= iBotCount; i++)
-    {
-        delete view_as<ArrayList>(dpTable.Get(i));
-        delete view_as<ArrayList>(choiceTable.Get(i));
-        
-        ArrayList usedRecsRow = view_as<ArrayList>(usedRecsTable.Get(i));
-        for (int b = 0; b < iBudgetSize; b++)
-        {
-            delete view_as<ArrayList>(usedRecsRow.Get(b));
-        }
-        delete usedRecsRow;
-    }
-    delete dpTable;
-    delete choiceTable;
-    delete usedRecsTable;
-    
-    return result;
-}
-
-// ============================================================================
-// 局部搜索优化
-// ============================================================================
-
-KnapsackResult LocalSearchOptimize(KnapsackResult initial, ArrayList hBots, 
-                                   ArrayList hRecInfoList, int iTotalBudget)
-{
-    KnapsackResult current;
-    current.isValid = initial.isValid;
-    current.totalValue = initial.totalValue;
-    current.totalCost = initial.totalCost;
-    for (int i = 0; i <= MAXPLAYERS; i++)
-        current.assignment[i] = initial.assignment[i];
-    
-    int currentQuality = EvaluateAssignmentQuality(current, hBots, hRecInfoList);
-    
-    bool improved = true;
-    int iteration = 0;
-    const int MAX_ITERATIONS = 50;
-    
-    while (improved && iteration < MAX_ITERATIONS)
-    {
-        improved = false;
-        iteration++;
-        
-        int iBotCount = hBots.Length;
-        int iRecCount = hRecInfoList.Length;
-        
-        // 策略1:尝试两两交换Bot的REC分配
-        for (int i = 0; i < iBotCount - 1; i++)
-        {
-            for (int j = i + 1; j < iBotCount; j++)
-            {
-                KnapsackResult candidate;
-                candidate.isValid = current.isValid;
-                candidate.totalValue = current.totalValue;
-                candidate.totalCost = current.totalCost;
-                for (int k = 0; k <= MAXPLAYERS; k++)
-                    candidate.assignment[k] = current.assignment[k];
-                
-                // 交换Bot i和Bot j的分配
-                int temp = candidate.assignment[i];
-                candidate.assignment[i] = candidate.assignment[j];
-                candidate.assignment[j] = temp;
-                
-                RecalculateResult(candidate, hBots, hRecInfoList);
-                
-                if (candidate.totalCost > iTotalBudget)
-                    continue;
-                
-                if (!CanTeamAfford(candidate, hBots, hRecInfoList))
-                    continue;
-                
-                int candidateQuality = EvaluateAssignmentQuality(candidate, hBots, hRecInfoList);
-                
-                if (candidateQuality > currentQuality)
-                {
-                    if (!ValidateAssignmentUniqueness(candidate, iBotCount))
-                    {
-                        continue;
-                    }
-                    current.isValid = candidate.isValid;
-                    current.totalValue = candidate.totalValue;
-                    current.totalCost = candidate.totalCost;
-                    for (int k = 0; k <= MAXPLAYERS; k++)
-                        current.assignment[k] = candidate.assignment[k];
-                    
-                    currentQuality = candidateQuality;
-                    improved = true;
-                }
-            }
-        }
-        
-        // 策略2:尝试单个Bot替换REC
-        for (int i = 0; i < iBotCount; i++)
-        {
-            int originalRec = current.assignment[i];
-            
-            for (int r = 0; r < iRecCount; r++)
-            {
-                if (r == originalRec)
-                    continue;
-                
-                bool bRecInUse = false;
-                for (int b = 0; b < iBotCount; b++)
-                {
-                    if (b != i && current.assignment[b] == r)
-                    {
-                        bRecInUse = true;
-                        break;
-                    }
-                }
-                
-                if (bRecInUse)
-                    continue;
-                
-                KnapsackResult candidate;
-                candidate.isValid = current.isValid;
-                candidate.totalValue = current.totalValue;
-                candidate.totalCost = current.totalCost;
-                for (int k = 0; k <= MAXPLAYERS; k++)
-                    candidate.assignment[k] = current.assignment[k];
-                
-                candidate.assignment[i] = r;
-                
-                RecalculateResult(candidate, hBots, hRecInfoList);
-                
-                if (candidate.totalCost > iTotalBudget)
-                    continue;
-                
-                if (!CanTeamAfford(candidate, hBots, hRecInfoList))
-                    continue;
-                
-                int candidateQuality = EvaluateAssignmentQuality(candidate, hBots, hRecInfoList);
-                
-                if (candidateQuality > currentQuality)
-                {
-                    if (!ValidateAssignmentUniqueness(candidate, iBotCount))
-                    {
-                        continue;
-                    }
-                    
-                    current.isValid = candidate.isValid;
-                    current.totalValue = candidate.totalValue;
-                    current.totalCost = candidate.totalCost;
-                    for (int k = 0; k <= MAXPLAYERS; k++)
-                        current.assignment[k] = candidate.assignment[k];
-                    
-                    currentQuality = candidateQuality;
-                    improved = true;
-                }
-            }
-        }
-    }
-    
-    return current;
-}
-
-// ============================================================================
-// 质量评估函数（核心软约束）
-// ============================================================================
-
-int EvaluateAssignmentQuality(KnapsackResult result, ArrayList hBots, 
-                              ArrayList hRecInfoList)
-{
-    int quality = result.totalValue;
-    
-    int iBotCount = hBots.Length;
-    
-    // 软约束1：惩罚装备价值分布不均 
-    ArrayList values = new ArrayList();
-    int totalValue = 0;
-    
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int recIndex = result.assignment[i];
-        if (recIndex >= 0)
-        {
-            RecEquipmentInfo recInfo;
-            hRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
-            values.Push(recInfo.totalValue);
-            totalValue += recInfo.totalValue;
-        }
-        else
-        {
-            values.Push(0);
-        }
-    }
-    
-    float avgValue = float(totalValue) / float(iBotCount);
-    float variance = 0.0;
-    
-    for (int i = 0; i < iBotCount; i++)
-    {
-        float diff = float(values.Get(i)) - avgValue;
-        variance += diff * diff;
-    }
-    variance /= float(iBotCount);
-    
-    int variancePenalty = RoundFloat(variance / 100.0);
-    quality -= variancePenalty;
-    
-// 软约束2：奖励武器多样性 
-    int primaryCount[10];  // 统计各类主武器数量
-    for (int i = 0; i < 10; i++)
-        primaryCount[i] = 0;
-    
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int recIndex = result.assignment[i];
-        if (recIndex >= 0)
-        {
-            RecEquipmentInfo recInfo;
-            hRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
-            
-            if (recInfo.hasSniper)
-                primaryCount[0]++;
-            else if (recInfo.hasRifle)
-                primaryCount[1]++;
-            else if (recInfo.hasPrimary)
-                primaryCount[2]++;
-        }
-    }
-    
-    // 理想配置：1狙击+4步枪，或5步枪
-    int diversityBonus = 0;
-    if (primaryCount[0] == 1 && primaryCount[1] >= 3)
-        diversityBonus = 200;  // 1 AWP + 步枪
-    else if (primaryCount[1] == 5)
-        diversityBonus = 150;  // 全步枪
-    else if (primaryCount[0] == 0 && primaryCount[1] >= 4)
-        diversityBonus = 100;  // 4+步枪
-    
-    quality += diversityBonus;
-    
-    // 软约束3：奖励道具配置
-    int totalUtility = 0;
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int recIndex = result.assignment[i];
-        if (recIndex >= 0)
-        {
-            RecEquipmentInfo recInfo;
-            hRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
-            totalUtility += recInfo.utilityCount;
-        }
-    }
-    
-    // 理想道具数量：8-12个（平均每人2个左右）
-    int utilityBonus = 0;
-    if (totalUtility >= 8 && totalUtility <= 12)
-        utilityBonus = 100;
-    else if (totalUtility >= 6)
-        utilityBonus = 50;
-    
-    quality += utilityBonus;
-    
-    // 软约束4：惩罚过度"发枪"需求
-    int totalDeficit = 0;
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int client = hBots.Get(i);
+        int client = hBots.Get(b);
         int clientMoney = GetEntProp(client, Prop_Send, "m_iAccount");
         
-        int recIndex = result.assignment[i];
-        if (recIndex >= 0)
+        // 找到该Bot能买得起且价值最高的REC
+        int iBestRecIndex = -1;
+        int iBestRecValue = -1;
+        
+        for (int r = 0; r < hRecInfoList.Length; r++)
         {
-            RecEquipmentInfo recInfo;
-            hRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
+            if (usedRecIndices.FindValue(r) != -1)
+                continue;
             
-            int deficit = recInfo.totalCost - clientMoney;
-            if (deficit > 0)
-                totalDeficit += deficit;
+            RecEquipmentInfo recInfo;
+            hRecInfoList.GetArray(r, recInfo, sizeof(RecEquipmentInfo));
+            
+            // 检查Bot是否买得起
+            if (recInfo.totalCost > clientMoney)
+                continue;
+                    
+            // 选择价值最高的
+            if (recInfo.totalValue > iBestRecValue)
+            {
+                iBestRecIndex = r;
+                iBestRecValue = recInfo.totalValue;
+            }
         }
-    }
     
-    // 发枪需求越大扣分越多
-    int dropPenalty = totalDeficit / 10;
-    quality -= dropPenalty;
-    
-    delete values;
-    
-    return quality;
-}
+        if (iBestRecIndex == -1)
+        {
+            delete usedRecIndices;
+            return false;
+        }
 
-// ============================================================================
-// 辅助函数
-// ============================================================================
+        assignment[b] = iBestRecIndex;
+        usedRecIndices.Push(iBestRecIndex);
+        
+        RecEquipmentInfo recInfo;
+        hRecInfoList.GetArray(iBestRecIndex, recInfo, sizeof(RecEquipmentInfo));
+        totalValue += recInfo.totalValue;
+        totalCost += recInfo.totalCost;
+    }
+
+    delete usedRecIndices;
+    return true;
+}
 
 // 获取某回合的REC文件列表
 ArrayList GetRecFilesForRound(const char[] szMap, const char[] szDemoFolder, 
@@ -4103,11 +3602,13 @@ ArrayList GetRecFilesForRound(const char[] szMap, const char[] szDemoFolder,
         delete hDir;
     }
     
+    hRecFiles.Sort(Sort_Ascending, Sort_String);
+    
     return hRecFiles;
 }
 
 // 构建REC装备信息缓存
-ArrayList BuildRecEquipmentCache(ArrayList hRecFiles, JSONObject jTeam, int iTeam)
+ArrayList BuildRecEquipmentInfo(ArrayList hRecFiles, JSONObject jTeam, int iTeam)
 {
     ArrayList hRecInfoList = new ArrayList(sizeof(RecEquipmentInfo));
     
@@ -4128,17 +3629,30 @@ ArrayList BuildRecEquipmentCache(ArrayList hRecFiles, JSONObject jTeam, int iTea
         
         recInfo.totalCost = 0;
         recInfo.totalValue = 0;
-        recInfo.tacticalValue = 0;
-        recInfo.hasPrimary = false;
-        recInfo.hasSniper = false;
-        recInfo.hasRifle = false;
-        recInfo.utilityCount = 0;
-        recInfo.primaryWeapon[0] = '\0';
         
-        // 第1步：从购买记录计算成本
-        ArrayList purchasedItems = new ArrayList(ByteCountToCells(64));
-        bool hasSlotItem[5] = {false, ...};  // 追踪各槽位是否有装备
+        if (jBotData.HasKey("initial_inventory"))
+        {
+            JSONArray jInitial = view_as<JSONArray>(jBotData.Get("initial_inventory"));
+            
+            for (int i = 0; i < jInitial.Length; i++)
+            {
+                char szItem[64];
+                jInitial.GetString(i, szItem, sizeof(szItem));
+                
+                if (!IsDefaultPistol(szItem))
+                {
+                    char szConvertedItem[64];
+                    GetTeamSpecificWeapon(szItem, iTeam, szConvertedItem, sizeof(szConvertedItem));
+                    
+                    int iPrice = GetItemPrice(szConvertedItem);
+                    recInfo.totalCost += iPrice;
+                }
+            }
+            
+            delete jInitial;
+        }
         
+        // 计算购买行为的花费
         if (jBotData.HasKey("purchases"))
         {
             JSONArray jPurchases = view_as<JSONArray>(jBotData.Get("purchases"));
@@ -4146,365 +3660,42 @@ ArrayList BuildRecEquipmentCache(ArrayList hRecFiles, JSONObject jTeam, int iTea
             for (int i = 0; i < jPurchases.Length; i++)
             {
                 JSONObject jAction = view_as<JSONObject>(jPurchases.Get(i));
-                
+        
                 char szAction[32];
                 jAction.GetString("action", szAction, sizeof(szAction));
                 
                 char szItem[64];
                 jAction.GetString("item", szItem, sizeof(szItem));
-                
-                // 转换对面阵营武器
+
                 char szConvertedItem[64];
                 GetTeamSpecificWeapon(szItem, iTeam, szConvertedItem, sizeof(szConvertedItem));
                 
-                int iSlot = GetWeaponSlotFromItem(szConvertedItem);
-                
                 if (StrEqual(szAction, "purchased", false))
                 {
-                    // 购买动作：加价格，标记槽位有装备
+                    if (IsDefaultPistol(szItem))
+                    {
+                        delete jAction;
+                        continue;
+                    }
+                    
                     int iPrice = GetItemPrice(szConvertedItem);
                     recInfo.totalCost += iPrice;
-                    purchasedItems.PushString(szConvertedItem);
-                    
-                    if (iSlot >= 0 && iSlot < 5)
-                        hasSlotItem[iSlot] = true;
-                }
-                else if (StrEqual(szAction, "dropped", false))
-                {
-                    // 丢弃动作：检查丢弃前槽位是否有装备
-                    if (iSlot >= 0 && iSlot < 5)
-                    {
-                        if (!hasSlotItem[iSlot])
-                        {
-                            // 保险措施：丢弃前槽位是空的，需要加上被丢弃武器的价格
-                            int iPrice = GetItemPrice(szConvertedItem);
-                            recInfo.totalCost += iPrice;
-                        }
-                        
-                        // 丢弃后槽位变空
-                        hasSlotItem[iSlot] = false;
-                    }
-                }
-                else if (StrEqual(szAction, "picked_up", false))
-                {
-                    // 拾取动作：标记槽位有装备，但不加价格
-                    if (iSlot >= 0 && iSlot < 5)
-                        hasSlotItem[iSlot] = true;
                 }
                 
                 delete jAction;
             }
             
-            delete jPurchases;
-        }
-        
-        // 第2步：检查final_inventory里有但purchases没有的物品
-        if (jBotData.HasKey("final_inventory"))
-        {
-            JSONArray jInventory = view_as<JSONArray>(jBotData.Get("final_inventory"));
-            
-            for (int i = 0; i < jInventory.Length; i++)
-            {
-                char szItem[64];
-                jInventory.GetString(i, szItem, sizeof(szItem));
-                
-                // 转换对面阵营武器
-                char szConvertedItem[64];
-                GetTeamSpecificWeapon(szItem, iTeam, szConvertedItem, sizeof(szConvertedItem));
-                
-                // 检查是否在purchased列表里
-                bool bWasPurchased = false;
-                for (int p = 0; p < purchasedItems.Length; p++)
-                {
-                    char szPurchased[64];
-                    purchasedItems.GetString(p, szPurchased, sizeof(szPurchased));
-                    
-                    if (StrEqual(szConvertedItem, szPurchased, false))
-                    {
-                        bWasPurchased = true;
-                        break;
-                    }
-                }
-                
-                // 获取价格（无论是否purchased都需要用于totalValue）
-                int iPrice = GetItemPrice(szConvertedItem);
-                
-                // 如果不在purchased列表里，需要加到totalCost
-                if (!bWasPurchased)
-                {
-                    recInfo.totalCost += iPrice;
-                }
-                
-                // 计算战术价值和总价值
-                int iTacticalValue = GetTacticalValue(szConvertedItem);
-                recInfo.tacticalValue += iTacticalValue;
-                recInfo.totalValue += iPrice;
-                
-                // 分析装备类型
-                int iSlot = GetWeaponSlotFromItem(szConvertedItem);
-                
-                if (iSlot == CS_SLOT_PRIMARY)
-                {
-                    recInfo.hasPrimary = true;
-                    strcopy(recInfo.primaryWeapon, sizeof(recInfo.primaryWeapon), szConvertedItem);
-                    
-                    if (IsSniperWeapon(szConvertedItem))
-                        recInfo.hasSniper = true;
-                    else if (IsRifleWeapon(szConvertedItem))
-                        recInfo.hasRifle = true;
-                }
-                else if (IsUtilityItem(szConvertedItem))
-                {
-                    recInfo.utilityCount++;
-                }
-            }
-            
-            delete jInventory;
-        }
-        
-        delete purchasedItems;
-        delete jBotData;
-        
-        hRecInfoList.PushArray(recInfo, sizeof(RecEquipmentInfo));
+        delete jPurchases;
+    }
+    
+    recInfo.totalValue = recInfo.totalCost;
+    
+    delete jBotData;
+    
+    hRecInfoList.PushArray(recInfo, sizeof(RecEquipmentInfo));
     }
     
     return hRecInfoList;
-}
-
-// 计算战术价值（带权重）
-int GetTacticalValue(const char[] szItem)
-{
-    int basePrice = GetItemPrice(szItem);
-    float multiplier = 1.0;
-    
-    // 主武器加权
-    if (IsRifleWeapon(szItem))
-    {
-        multiplier = 1.5;  // 步枪最重要
-    }
-    else if (IsSniperWeapon(szItem))
-    {
-        multiplier = 1.8;  // 狙击枪更重要
-    }
-    else if (IsSMGWeapon(szItem))
-    {
-        multiplier = 0.7;  // SMG战术价值较低
-    }
-    
-    // 道具加权
-    if (StrEqual(szItem, "smokegrenade", false))
-    {
-        multiplier = 2.0;  // 烟雾弹极重要
-    }
-    else if (StrEqual(szItem, "flashbang", false))
-    {
-        multiplier = 1.5;  // 闪光弹重要
-    }
-    else if (StrEqual(szItem, "hegrenade", false))
-    {
-        multiplier = 1.3;
-    }
-    else if (StrEqual(szItem, "molotov", false) || StrEqual(szItem, "incgrenade", false))
-    {
-        multiplier = 1.4;
-    }
-    
-    // 护甲加权
-    if (StrEqual(szItem, "vesthelm", false))
-    {
-        multiplier = 1.6;  // 头盔很重要
-    }
-    else if (StrEqual(szItem, "vest", false))
-    {
-        multiplier = 1.3;
-    }
-    
-    // 拆弹器
-    if (StrEqual(szItem, "defuser", false))
-    {
-        multiplier = 1.5;
-    }
-    
-    return RoundFloat(float(basePrice) * multiplier);
-}
-
-// 重新计算结果的总成本和总价值
-void RecalculateResult(KnapsackResult result, ArrayList hBots, ArrayList hRecInfoList)
-{
-    result.totalCost = 0;
-    result.totalValue = 0;
-    
-    int iBotCount = hBots.Length;
-    
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int recIndex = result.assignment[i];
-        if (recIndex >= 0 && recIndex < hRecInfoList.Length)
-        {
-            RecEquipmentInfo recInfo;
-            hRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
-            
-            result.totalCost += recInfo.totalCost;
-            result.totalValue += recInfo.tacticalValue;
-        }
-    }
-}
-
-// 检查团队是否能负担（考虑虚拟发枪）
-bool CanTeamAfford(KnapsackResult result, ArrayList hBots, ArrayList hRecInfoList)
-{
-    int iBotCount = hBots.Length;
-    
-    // 计算总经济和总需求
-    int totalMoney = 0;
-    int totalRequired = 0;
-    
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int client = hBots.Get(i);
-        int clientMoney = GetEntProp(client, Prop_Send, "m_iAccount");
-        totalMoney += clientMoney;
-        
-        int recIndex = result.assignment[i];
-        if (recIndex >= 0)
-        {
-            RecEquipmentInfo recInfo;
-            hRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
-            totalRequired += recInfo.totalCost;
-        }
-    }
-    
-    // 只要总经济够就行（允许虚拟发枪）
-    return (totalMoney >= totalRequired);
-}
-
-// 虚拟发枪模拟
-void SimulateDropSystem(ArrayList hBots, KnapsackResult result, ArrayList hRecInfoList)
-{
-    int iBotCount = hBots.Length;
-    
-    // 使用 ArrayList 存储 bot 信息
-    ArrayList botInfos = new ArrayList(sizeof(BotEconomyInfo));
-    
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int client = hBots.Get(i);
-        
-        BotEconomyInfo info;
-        info.client = client;
-        info.money = GetEntProp(client, Prop_Send, "m_iAccount");
-        info.teamIndex = i;
-        
-        int recIndex = result.assignment[i];
-        if (recIndex >= 0)
-        {
-            RecEquipmentInfo recInfo;
-            hRecInfoList.GetArray(recIndex, recInfo, sizeof(RecEquipmentInfo));
-            
-            info.assignedRecIndex = recIndex;
-            info.assignedCost = recInfo.totalCost;
-            info.assignedValue = recInfo.totalValue;
-            strcopy(info.assignedRecName, PLATFORM_MAX_PATH, recInfo.recName);
-        }
-        else
-        {
-            info.assignedRecIndex = -1;
-            info.assignedCost = 0;
-            info.assignedValue = 0;
-            info.assignedRecName[0] = '\0';
-        }
-        
-        botInfos.PushArray(info, sizeof(BotEconomyInfo));
-    }
-    
-    // 按经济排序 (使用 SortADTArrayCustom)
-    SortADTArrayCustom(botInfos, Sort_BotEconomyByMoney);
-    
-    // 分配"虚拟发枪"
-    for (int i = 0; i < iBotCount; i++)
-    {
-        BotEconomyInfo info;
-        botInfos.GetArray(i, info, sizeof(BotEconomyInfo));
-        
-        int deficit = info.assignedCost - info.money;
-        
-        if (deficit > 0)
-        {
-            for (int j = iBotCount - 1; j >= 0; j--)
-            {
-                if (j == i)
-                    continue;
-                
-                BotEconomyInfo richInfo;
-                botInfos.GetArray(j, richInfo, sizeof(BotEconomyInfo));
-                
-                int surplus = richInfo.money - richInfo.assignedCost;
-                
-                if (surplus > 0)
-                {
-                    int transfer = (surplus < deficit) ? surplus : deficit;
-                    
-                    richInfo.money -= transfer;
-                    info.money += transfer;
-                    deficit -= transfer;
-                    
-                    // 更新数组
-                    botInfos.SetArray(j, richInfo, sizeof(BotEconomyInfo));
-                    
-                    if (deficit <= 0)
-                        break;
-                }
-            }
-        }
-    }
-    
-    delete botInfos;
-}
-
-// 排序函数:按金钱升序
-public int Sort_BotEconomyByMoney(int index1, int index2, Handle array, Handle hndl)
-{
-    ArrayList list = view_as<ArrayList>(array);
-    
-    BotEconomyInfo info1, info2;
-    list.GetArray(index1, info1, sizeof(BotEconomyInfo));
-    list.GetArray(index2, info2, sizeof(BotEconomyInfo));
-    
-    if (info1.money < info2.money) return -1;
-    if (info1.money > info2.money) return 1;
-    return 0;
-}
-
-/**
- * 验证分配结果中没有重复的REC
- * 
- * @param result        分配结果
- * @param iBotCount     Bot数量
- * @return              true=所有REC唯一, false=存在重复
- */
-bool ValidateAssignmentUniqueness(KnapsackResult result, int iBotCount)
-{
-    ArrayList usedRecs = new ArrayList();
-    
-    for (int i = 0; i < iBotCount; i++)
-    {
-        int recIndex = result.assignment[i];
-        
-        if (recIndex < 0)
-            continue;
-        
-        // 检查是否已使用
-        if (usedRecs.FindValue(recIndex) != -1)
-        {
-            delete usedRecs;
-            return false;
-        }
-        
-        usedRecs.Push(recIndex);
-    }
-    
-    delete usedRecs;
-    return true;
 }
 
 /**
@@ -4513,19 +3704,21 @@ bool ValidateAssignmentUniqueness(KnapsackResult result, int iBotCount)
  */
 void ScheduleDynamicPause(int iRound)
 {
-    // 检查 bot_pause 插件是否加载
+    if (IsInWarmup())
+    {
+        return;
+    }
+    
     if (!g_bPausePluginLoaded)
     {
         return;
     }
     
-    // 检查回合是否有效
     if (iRound < 0 || iRound >= 31)
     {
         return;
     }
     
-    // 检查该回合的冻结时间是否有效
     if (!g_bAllRoundFreezeTimeValid[iRound])
     {
         return;
@@ -4559,35 +3752,28 @@ void ScheduleDynamicPause(int iRound)
     
     if (fTimeDiff > fMaxDelayedPause)
     {
-        // 立即长暂停
         fPauseDelay = 0.0;
         iPauseTime = RoundToNearest(fTimeDiff);
     }
     else if (fTimeDiff <= 30.0)
     {
-        // 立即短暂停
         fPauseDelay = 0.0;
         iPauseTime = RoundToNearest(fTimeDiff);
     }
     else
     {
-        // 延迟后暂停30秒
         fPauseDelay = fTimeDiff - 30.0;
         iPauseTime = 30;
     }
     
-    // 随机选择一个队伍的bot来执行暂停
     int iBotToUse = -1;
     int iTeamToUse = -1;
     
-    // 获取两队的可用暂停次数
     int iPausesLeftT = BotPause_GetTeamPausesLeft(CS_TEAM_T);
     int iPausesLeftCT = BotPause_GetTeamPausesLeft(CS_TEAM_CT);
     
-    // 随机选择队伍（优先有暂停次数的队伍）
     if (iPausesLeftT > 0 && iPausesLeftCT > 0)
     {
-        // 两队都有暂停次数，随机选择
         iTeamToUse = GetRandomInt(0, 1) == 0 ? CS_TEAM_T : CS_TEAM_CT;
     }
     else if (iPausesLeftT > 0)
@@ -4603,7 +3789,6 @@ void ScheduleDynamicPause(int iRound)
         return;
     }
     
-    // 在选定的队伍中找一个bot
     for (int i = 1; i <= MaxClients; i++)
     {
         if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
@@ -4618,7 +3803,6 @@ void ScheduleDynamicPause(int iRound)
     
     if (iBotToUse == -1)
     {
-        // 尝试另一个队伍
         int iOtherTeam = (iTeamToUse == CS_TEAM_T) ? CS_TEAM_CT : CS_TEAM_T;
         int iOtherPauses = BotPause_GetTeamPausesLeft(iOtherTeam);
         
@@ -4668,9 +3852,8 @@ public Action Timer_BotExecutePause(Handle hTimer, DataPack pack)
     {
         return Plugin_Stop;
     }
-    
-    // 让bot发送暂停命令（如果是默认时间则不带参数）
-    if (iPauseTime == 30)  // DEFAULT_PAUSE_TIME
+
+    if (iPauseTime == 30)  
     {
         FakeClientCommand(client, "say .p");
     }
@@ -4720,7 +3903,7 @@ void InitWeaponData()
     g_hWeaponPrices.SetValue("deagle", 700);
     g_hWeaponPrices.SetValue("p250", 300);
     g_hWeaponPrices.SetValue("tec9", 500);
-    g_hWeaponPrices.SetValue("fiveseven", 500);
+    g_hWeaponPrices.SetValue("fn57", 500);
     g_hWeaponPrices.SetValue("cz75a", 500);
     g_hWeaponPrices.SetValue("elite", 300);
     g_hWeaponPrices.SetValue("revolver", 600);
@@ -4735,69 +3918,58 @@ void InitWeaponData()
     g_hWeaponPrices.SetValue("defuser", 400);
     g_hWeaponPrices.SetValue("taser", 200);
     
-    // T阵营武器转换
-    g_hWeaponConversion_T.SetString("m4a1", "ak47");
-    g_hWeaponConversion_T.SetString("m4a1_silencer", "ak47");
-    g_hWeaponConversion_T.SetString("famas", "galilar");
-    g_hWeaponConversion_T.SetString("aug", "sg556");
-    g_hWeaponConversion_T.SetString("mp9", "mac10");
-    g_hWeaponConversion_T.SetString("fiveseven", "tec9");
-    g_hWeaponConversion_T.SetString("usp_silencer", "glock");
-    g_hWeaponConversion_T.SetString("hkp2000", "glock");
-    g_hWeaponConversion_T.SetString("scar20", "g3sg1");
-    g_hWeaponConversion_T.SetString("mag7", "sawedoff");
-    g_hWeaponConversion_T.SetString("incgrenade", "molotov");
-
-    // CT阵营武器转换
-    g_hWeaponConversion_CT.SetString("ak47", "m4a1");
-    g_hWeaponConversion_CT.SetString("galilar", "famas");
-    g_hWeaponConversion_CT.SetString("sg556", "aug");
-    g_hWeaponConversion_CT.SetString("mac10", "mp9");
-    g_hWeaponConversion_CT.SetString("tec9", "fiveseven");
-    g_hWeaponConversion_CT.SetString("glock", "hkp2000");
-    g_hWeaponConversion_CT.SetString("g3sg1", "scar20");
-    g_hWeaponConversion_CT.SetString("sawedoff", "mag7");
-    g_hWeaponConversion_CT.SetString("molotov", "incgrenade");
+    // 使用辅助函数双向设置转换
+    SetBidirectionalConversion("m4a1", "ak47");
+    SetBidirectionalConversion("m4a1_silencer", "ak47");
+    SetBidirectionalConversion("famas", "galilar");
+    SetBidirectionalConversion("aug", "sg556");
+    SetBidirectionalConversion("mp9", "mac10");
+    SetBidirectionalConversion("fn57", "tec9");
+    SetBidirectionalConversion("usp_silencer", "glock");
+    SetBidirectionalConversion("hkp2000", "glock");
+    SetBidirectionalConversion("scar20", "g3sg1");
+    SetBidirectionalConversion("mag7", "sawedoff");
+    SetBidirectionalConversion("incgrenade", "molotov");
     
-    // 武器类型 (位标记: 1=步枪, 2=狙击, 4=SMG, 8=道具, 16=默认手枪)
-    g_hWeaponTypes.SetValue("ak47", 1);
-    g_hWeaponTypes.SetValue("m4a1", 1);
-    g_hWeaponTypes.SetValue("m4a1_silencer", 1);
-    g_hWeaponTypes.SetValue("aug", 1);
-    g_hWeaponTypes.SetValue("sg556", 1);
-    g_hWeaponTypes.SetValue("famas", 1);
-    g_hWeaponTypes.SetValue("galilar", 1);
+    // 武器类型 
+    g_hWeaponTypes.SetValue("ak47", WEAPON_TYPE_RIFLE);
+    g_hWeaponTypes.SetValue("m4a1", WEAPON_TYPE_RIFLE);
+    g_hWeaponTypes.SetValue("m4a1_silencer", WEAPON_TYPE_RIFLE);
+    g_hWeaponTypes.SetValue("aug", WEAPON_TYPE_RIFLE);
+    g_hWeaponTypes.SetValue("sg556", WEAPON_TYPE_RIFLE);
+    g_hWeaponTypes.SetValue("famas", WEAPON_TYPE_RIFLE);
+    g_hWeaponTypes.SetValue("galilar", WEAPON_TYPE_RIFLE);
     
-    g_hWeaponTypes.SetValue("awp", 2);
-    g_hWeaponTypes.SetValue("ssg08", 2);
-    g_hWeaponTypes.SetValue("scar20", 2);
-    g_hWeaponTypes.SetValue("g3sg1", 2);
+    g_hWeaponTypes.SetValue("awp", WEAPON_TYPE_SNIPER);
+    g_hWeaponTypes.SetValue("ssg08", WEAPON_TYPE_SNIPER);
+    g_hWeaponTypes.SetValue("scar20", WEAPON_TYPE_SNIPER);
+    g_hWeaponTypes.SetValue("g3sg1", WEAPON_TYPE_SNIPER);
     
-    g_hWeaponTypes.SetValue("mp9", 4);
-    g_hWeaponTypes.SetValue("mac10", 4);
-    g_hWeaponTypes.SetValue("ump45", 4);
-    g_hWeaponTypes.SetValue("p90", 4);
-    g_hWeaponTypes.SetValue("bizon", 4);
-    g_hWeaponTypes.SetValue("mp7", 4);
+    g_hWeaponTypes.SetValue("mp9", WEAPON_TYPE_SMG);
+    g_hWeaponTypes.SetValue("mac10", WEAPON_TYPE_SMG);
+    g_hWeaponTypes.SetValue("ump45", WEAPON_TYPE_SMG);
+    g_hWeaponTypes.SetValue("p90", WEAPON_TYPE_SMG);
+    g_hWeaponTypes.SetValue("bizon", WEAPON_TYPE_SMG);
+    g_hWeaponTypes.SetValue("mp7", WEAPON_TYPE_SMG);
     
-    g_hWeaponTypes.SetValue("smokegrenade", 8);
-    g_hWeaponTypes.SetValue("flashbang", 8);
-    g_hWeaponTypes.SetValue("hegrenade", 8);
-    g_hWeaponTypes.SetValue("molotov", 8);
-    g_hWeaponTypes.SetValue("incgrenade", 8);
-    g_hWeaponTypes.SetValue("decoy", 8);
+    g_hWeaponTypes.SetValue("smokegrenade", WEAPON_TYPE_UTILITY);
+    g_hWeaponTypes.SetValue("flashbang", WEAPON_TYPE_UTILITY);
+    g_hWeaponTypes.SetValue("hegrenade", WEAPON_TYPE_UTILITY);
+    g_hWeaponTypes.SetValue("molotov", WEAPON_TYPE_UTILITY);
+    g_hWeaponTypes.SetValue("incgrenade", WEAPON_TYPE_UTILITY);
+    g_hWeaponTypes.SetValue("decoy", WEAPON_TYPE_UTILITY);
     
-    g_hWeaponTypes.SetValue("glock", 16);
-    g_hWeaponTypes.SetValue("hkp2000", 16);
-    g_hWeaponTypes.SetValue("usp_silencer", 16);
+    g_hWeaponTypes.SetValue("glock", WEAPON_TYPE_DEFAULT_PISTOL);
+    g_hWeaponTypes.SetValue("hkp2000", WEAPON_TYPE_DEFAULT_PISTOL);
+    g_hWeaponTypes.SetValue("usp_silencer", WEAPON_TYPE_DEFAULT_PISTOL);
 }
 
-// 武器类型常量定义
-#define WEAPON_TYPE_RIFLE 1
-#define WEAPON_TYPE_SNIPER 2
-#define WEAPON_TYPE_SMG 4
-#define WEAPON_TYPE_UTILITY 8
-#define WEAPON_TYPE_DEFAULT_PISTOL 16
+// 双向设置武器转换
+void SetBidirectionalConversion(const char[] ctWeapon, const char[] tWeapon)
+{
+    g_hWeaponConversion_T.SetString(ctWeapon, tWeapon);
+    g_hWeaponConversion_CT.SetString(tWeapon, ctWeapon);
+}
 
 // 武器类型检查函数
 stock bool IsWeaponType(const char[] szItem, int typeFlag)
@@ -4826,21 +3998,6 @@ bool GetTeamSpecificWeapon(const char[] szWeapon, int iTeam, char[] szOutput, in
 bool IsSniperWeapon(const char[] szItem)
 {
     return IsWeaponType(szItem, WEAPON_TYPE_SNIPER);
-}
-
-bool IsRifleWeapon(const char[] szItem)
-{
-    return IsWeaponType(szItem, WEAPON_TYPE_RIFLE);
-}
-
-bool IsSMGWeapon(const char[] szItem)
-{
-    return IsWeaponType(szItem, WEAPON_TYPE_SMG);
-}
-
-bool IsUtilityItem(const char[] szItem)
-{
-    return IsWeaponType(szItem, WEAPON_TYPE_UTILITY);
 }
 
 bool IsDefaultPistol(const char[] szItem)
@@ -4915,7 +4072,7 @@ public Action Command_DebugInfo(int client, int args)
 }
 
 // ============================================================================
-// 共享库函数实现
+// 共享库函数
 // ============================================================================
 
 /**
@@ -4986,7 +4143,7 @@ stock bool BotShared_CanSeeEnemy(int client)
 }
 
 /**
- * 获取缓存的敌人（性能优化版本）
+ * 获取缓存的敌人
  */
 stock int BotShared_GetCachedEnemy(int client)
 {
@@ -5038,7 +4195,6 @@ stock void BotShared_ResetBotState(int client)
  */
 stock void BotShared_ResetBombState()
 {
-    // 预留函数
 }
 
 // ============================================================================
@@ -5063,11 +4219,9 @@ bool LoadC4HolderDataFile(const char[] szRecFolder)
         return false;
     }
     
-    // 清理旧数据
     if (g_jC4HolderData != null)
         delete g_jC4HolderData;
     
-    // 加载JSON
     g_jC4HolderData = view_as<JSONArray>(JSONArray.FromFile(szPath));
     if (g_jC4HolderData == null)
     {
@@ -5085,7 +4239,6 @@ bool GetC4HolderForRound(int iRound, char[] szPlayerName, int iMaxLen)
     if (g_jC4HolderData == null)
         return false;
     
-    // round1 对应 iRound=0, 所以查找时 +1
     int iTargetRound = iRound + 1;
     
     for (int i = 0; i < g_jC4HolderData.Length; i++)
@@ -5109,7 +4262,7 @@ bool GetC4HolderForRound(int iRound, char[] szPlayerName, int iMaxLen)
 }
 
 /**
- * 冻结时间开始时分配C4
+ * 冻结时间开始时分配botC4
  */
 public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
 {
@@ -5120,7 +4273,6 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
         return Plugin_Stop;
     }
     
-    // 首先检查C4是否在真人玩家手上
     bool bIsOnRealPlayer = false;
     
     for (int i = 1; i <= MaxClients; i++)
@@ -5145,13 +4297,11 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
         }
     }
     
-    // 如果C4在玩家手上，不进行转移
     if (bIsOnRealPlayer)
     {
         return Plugin_Stop;
     }
     
-    // 查找目标bot
     int iTargetBot = -1;
     
     for (int i = 1; i <= MaxClients; i++)
@@ -5162,7 +4312,6 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
         if (GetClientTeam(i) != CS_TEAM_T)
             continue;
         
-        // 检查REC名称是否匹配
         if (g_szCurrentRecName[i][0] == '\0')
             continue;
         
@@ -5185,7 +4334,7 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
         return Plugin_Stop;
     }
     
-    // 移除所有其他T方bot的C4（不包括真人玩家）
+    // 移除所有其他T方bot的C4
     for (int i = 1; i <= MaxClients; i++)
     {
         if (!IsValidClient(i) || !IsPlayerAlive(i) || i == iTargetBot)
@@ -5194,7 +4343,6 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
         if (GetClientTeam(i) != CS_TEAM_T)
             continue;
         
-        // 跳过真人玩家
         if (!IsFakeClient(i))
             continue;
         
@@ -5218,6 +4366,12 @@ public Action Timer_AssignC4AtFreezeStart(Handle hTimer)
     return Plugin_Stop;
 }
 
+// 检查热身
+bool IsInWarmup()
+{
+    return !!GameRules_GetProp("m_bWarmupPeriod");
+}
+
 public void OnLibraryAdded(const char[] name)
 {
     if (StrEqual(name, "bot_pause"))
@@ -5232,4 +4386,342 @@ public void OnLibraryRemoved(const char[] name)
     {
         g_bPausePluginLoaded = false;
     }
-}    
+}   
+
+// ============================================================================
+// 语音文件预缓存系统
+// ============================================================================
+
+/**
+ * FakePrecacheSound - 用于预缓存音频文件
+ */
+stock void FakePrecacheSound(const char[] szPath)
+{
+    char szBuffer[PLATFORM_MAX_PATH];
+    PrecacheSound(szPath, true);
+    Format(szBuffer, sizeof(szBuffer), "sound/%s", szPath);
+    AddFileToDownloadsTable(szBuffer);
+}
+
+// ============================================================================
+// 缓存管理系统
+// ============================================================================
+
+/**
+ * 加载demo的所有数据到缓存
+ */
+void LoadAllDemoData(const char[] szMap, const char[] szDemoFolder)
+{
+    PrintToServer("[Bot REC Cache] Loading all data for: %s", szDemoFolder);
+    
+    // 清理旧缓存
+    ClearAllCachedData();
+    
+    // 加载freeze时间
+    float fDummy[31];
+    bool bDummy[31];
+    LoadFreezeTimes(szMap, szDemoFolder, fDummy, bDummy);
+    
+    // 加载购买数据
+    LoadPurchaseDataFile(szDemoFolder);
+    
+    // 加载聊天数据
+    LoadChatDataFile(szDemoFolder);
+
+    // 加载语音数据
+    LoadVoiceDataFile(szDemoFolder);
+    
+    // 加载C4持有者数据
+    LoadC4HolderDataFile(szDemoFolder);
+    
+    // 加载money数据
+    LoadMoneyDataFile(szDemoFolder);
+    
+    PrintToServer("[Bot REC Cache] All data loaded successfully");
+}
+
+/**
+ * 清理所有缓存数据
+ */
+void ClearAllCachedData()
+{
+    if (g_jPurchaseData != null)
+    {
+        delete g_jPurchaseData;
+        g_jPurchaseData = null;
+    }
+    
+    if (g_jChatData != null)
+    {
+        delete g_jChatData;
+        g_jChatData = null;
+    }
+
+    if (g_jVoiceData != null)
+    {
+        delete g_jVoiceData;
+        g_jVoiceData = null;
+    }
+    
+    if (g_jC4HolderData != null)
+    {
+        delete g_jC4HolderData;
+        g_jC4HolderData = null;
+    }
+    
+    if (g_jMoneyData != null)
+    {
+        delete g_jMoneyData;
+        g_jMoneyData = null;
+    }
+}
+
+/**
+ * 加载money.json到缓存
+ */
+bool LoadMoneyDataFile(const char[] szRecFolder)
+{
+    char szMap[64];
+    GetCurrentMap(szMap, sizeof(szMap));
+    GetMapDisplayName(szMap, szMap, sizeof(szMap));
+    
+    char szPath[PLATFORM_MAX_PATH];
+    BuildPath(Path_SM, szPath, sizeof(szPath), 
+        "data/botmimic/all/%s/%s/money.json", szMap, szRecFolder);
+    
+    if (!FileExists(szPath))
+    {
+        return false;
+    }
+    
+    if (g_jMoneyData != null)
+        delete g_jMoneyData;
+    
+    g_jMoneyData = JSONObject.FromFile(szPath);
+    
+    return (g_jMoneyData != null);
+}
+
+// ============================================================================
+// 语音系统
+// ============================================================================
+
+/**
+ * 加载语音数据文件
+ */
+bool LoadVoiceDataFile(const char[] szRecFolder)
+{
+    char szMap[64];
+    GetCurrentMap(szMap, sizeof(szMap));
+    GetMapDisplayName(szMap, szMap, sizeof(szMap));
+    
+    char szPath[PLATFORM_MAX_PATH];
+    Format(szPath, sizeof(szPath), 
+        "sound/botrec/%s/%s/voice_info.json", szMap, szRecFolder);
+
+    if (!FileExists(szPath))
+    {
+        return false;
+    }
+    
+    // 清理旧数据
+    if (g_jVoiceData != null)
+        delete g_jVoiceData;
+
+    // 加载JSON
+    g_jVoiceData = view_as<JSONArray>(JSONArray.FromFile(szPath));
+    if (g_jVoiceData == null)
+    {
+        return false;
+    }
+    
+    PrintToServer("[Bot REC Cache] Loaded voice data from: %s", szPath);
+
+    for (int i = 0; i < g_jVoiceData.Length; i++)
+    {
+        JSONObject jRecord = view_as<JSONObject>(g_jVoiceData.Get(i));
+        if (!jRecord.HasKey("speeches")) { delete jRecord; continue; }
+
+        int iRecordRound = jRecord.GetInt("round");
+        
+        JSONArray jSpeeches = view_as<JSONArray>(jRecord.Get("speeches"));
+        for (int j = 0; j < jSpeeches.Length; j++)
+        {
+            JSONObject jSpeech = view_as<JSONObject>(jSpeeches.Get(j));
+            char szVoiceFile[PLATFORM_MAX_PATH];
+            jSpeech.GetString("file_name", szVoiceFile, sizeof(szVoiceFile));
+            
+            char szTeams[2][4] = { "t", "ct" };
+            
+            for(int t=0; t<2; t++) {
+                char szVoicePath[PLATFORM_MAX_PATH];
+                Format(szVoicePath, sizeof(szVoicePath), "botrec/%s/%s/round%d/%s/%s", szMap, szRecFolder, iRecordRound, szTeams[t], szVoiceFile);
+                
+                char szFullPath[PLATFORM_MAX_PATH];
+                Format(szFullPath, sizeof(szFullPath), "sound/%s", szVoicePath);
+                
+                if(FileExists(szFullPath)) {
+                    AddFileToDownloadsTable(szFullPath); 
+                    PrecacheSound(szVoicePath, true);    
+                }
+            }
+            delete jSpeech;
+        }
+        delete jSpeeches;
+        delete jRecord;
+    }
+
+    return true;
+}
+
+/**
+ * 为bot加载语音动作
+ */
+bool LoadVoiceActionsForBot(int client, int iRound)
+{
+    if (IsInWarmup() || g_jVoiceData == null) return false;
+    if (g_szCurrentRecName[client][0] == '\0') return false;
+    
+    char szBotRecName[PLATFORM_MAX_PATH];
+    strcopy(szBotRecName, sizeof(szBotRecName), g_szCurrentRecName[client]);
+
+    // 清理旧数据
+    if (g_hVoiceActions[client] != null) delete g_hVoiceActions[client];
+    if (g_hVoiceFiles[client] != null) delete g_hVoiceFiles[client];
+    
+    g_hVoiceActions[client] = new ArrayList(sizeof(VoiceActionEntry));
+    g_hVoiceFiles[client] = new ArrayList(ByteCountToCells(PLATFORM_MAX_PATH));
+    g_iVoiceActionIndex[client] = 0;
+    
+    int iVoiceCount = 0;
+    int iTargetRound = iRound + 1;
+    int iTeam = GetClientTeam(client);
+    char szTeamFolder[8];
+    
+    if (iTeam == CS_TEAM_T) strcopy(szTeamFolder, sizeof(szTeamFolder), "t");
+    else if (iTeam == CS_TEAM_CT) strcopy(szTeamFolder, sizeof(szTeamFolder), "ct");
+    else return false;
+
+    for (int i = 0; i < g_jVoiceData.Length; i++)
+    {
+        JSONObject jRecord = view_as<JSONObject>(g_jVoiceData.Get(i));
+        int iRecordRound = jRecord.GetInt("round");
+        
+        if (iRecordRound != iTargetRound || !jRecord.HasKey("speeches"))
+        {
+            delete jRecord;
+            continue;
+        }
+        
+        JSONArray jSpeeches = view_as<JSONArray>(jRecord.Get("speeches"));
+        for (int j = 0; j < jSpeeches.Length; j++)
+        {
+            JSONObject jSpeech = view_as<JSONObject>(jSpeeches.Get(j));
+            char szPlayerName[MAX_NAME_LENGTH];
+            jSpeech.GetString("player_name", szPlayerName, sizeof(szPlayerName));
+            
+            if (!StrEqual(szPlayerName, szBotRecName, false))
+            {
+                delete jSpeech;
+                continue;
+            }
+            
+            VoiceActionEntry entry;
+            entry.startTime = jSpeech.GetFloat("start_time");
+            entry.duration = jSpeech.GetFloat("duration");
+            entry.isAlive = jSpeech.GetBool("is_alive");  
+            
+            char szVoiceFile[PLATFORM_MAX_PATH];
+            jSpeech.GetString("file_name", szVoiceFile, sizeof(szVoiceFile));
+            
+            // 构建路径
+            char szMap[64];
+            GetCurrentMap(szMap, sizeof(szMap));
+            GetMapDisplayName(szMap, szMap, sizeof(szMap));
+            char szUseDemoFolder[PLATFORM_MAX_PATH];
+            GetUseDemoFolder(client, szUseDemoFolder, sizeof(szUseDemoFolder));
+            
+            char szVoicePath[PLATFORM_MAX_PATH];
+            Format(szVoicePath, sizeof(szVoicePath), "botrec/%s/%s/round%d/%s/%s", 
+                szMap, szUseDemoFolder, iTargetRound, szTeamFolder, szVoiceFile);
+            
+            entry.fileIndex = g_hVoiceFiles[client].PushString(szVoicePath);
+            g_hVoiceActions[client].PushArray(entry, sizeof(VoiceActionEntry));
+            
+            iVoiceCount++;
+            delete jSpeech;
+        }
+        delete jSpeeches;
+        delete jRecord;
+    }
+    
+    return (iVoiceCount > 0);
+}
+
+/**
+ * 语音执行timer
+ */
+public Action Timer_ExecuteVoiceAction(Handle hTimer, DataPack pack)
+{
+    pack.Reset();
+    int iUserId = pack.ReadCell();
+    int client = GetClientOfUserId(iUserId);
+    
+    if (!IsValidClient(client))
+    {
+        g_hVoiceTimer[client] = null;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    if (IsInWarmup() || !g_bPlayingRoundStartRec[client] || g_hVoiceActions[client] == null)
+    {
+        g_hVoiceTimer[client] = null;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    float fCurrentTime = GetGameTime() - g_fRecStartTime[client];
+    bool bClientAlive = IsPlayerAlive(client);  // 获取bot当前存活状态
+    
+    while (g_iVoiceActionIndex[client] < g_hVoiceActions[client].Length)
+    {
+        VoiceActionEntry entry;
+        g_hVoiceActions[client].GetArray(g_iVoiceActionIndex[client], entry, sizeof(VoiceActionEntry));
+        
+        if (fCurrentTime < entry.startTime) break;
+        
+        // 检查存活状态是否匹配
+        if (entry.isAlive != bClientAlive)
+        {
+            g_iVoiceActionIndex[client]++;
+            continue;  // 状态不匹配，跳过这条语音
+        }
+        
+        // 检查是否正在说话
+        if (BotVoice_IsSpeaking(client))
+        {
+            g_iVoiceActionIndex[client]++;
+            continue;
+        }
+        
+        // 获取语音文件路径
+        char szVoiceFile[PLATFORM_MAX_PATH];
+        g_hVoiceFiles[client].GetString(entry.fileIndex, szVoiceFile, sizeof(szVoiceFile));
+        
+        // 开始说话
+        BotVoice_StartSpeaking(client, szVoiceFile, entry.duration);
+        
+        g_iVoiceActionIndex[client]++;
+        break;
+    }
+    
+    if (g_iVoiceActionIndex[client] >= g_hVoiceActions[client].Length)
+    {
+        g_hVoiceTimer[client] = null;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    return Plugin_Continue;
+}
