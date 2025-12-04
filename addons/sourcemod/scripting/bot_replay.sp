@@ -18,7 +18,7 @@ public Plugin myinfo =
 	name = "Bot Replay", 
 	author = "Tasty cup", 
 	description = "Play recordings for bots at round start", 
-	version = "1.1.2", 
+	version = "1.1.3", 
 	url = ""
 };
 
@@ -165,6 +165,12 @@ enum struct VoiceActionEntry
     bool isAlive;
 }
 
+// 出生点系统
+JSONObject g_jSpawnData = null;                   // spawns.json缓存
+ArrayList g_hTeamSpawnPoints[4];                  // 每个队伍的所有出生点
+float g_fAssignedSpawnPos[MAXPLAYERS+1][3];      // 每个玩家分配好的出生点
+bool g_bHasAssignedSpawn[MAXPLAYERS+1];          // 是否已分配出生点
+
 // 购买数据（用于经济模式）
 JSONObject g_jPurchaseData = null;
 JSONArray g_jC4HolderData = null;                 // C4持有者数据
@@ -258,6 +264,9 @@ public void OnPluginStart()
         g_hVoiceActions[i] = null;
         g_iVoiceActionIndex[i] = 0;     
         g_hVoiceFiles[i] = null;  
+
+        // 初始化出生点数据
+        g_bHasAssignedSpawn[i] = false;
     }
     
     // 重置阵营回合选择
@@ -276,6 +285,11 @@ public void OnMapStart()
     for (int i = 0; i < 4; i++)
     {
         g_fTeamVerifyDelay[i] = 0.0;
+        
+        // 初始化出生点数组
+        if (g_hTeamSpawnPoints[i] != null)
+            delete g_hTeamSpawnPoints[i];
+        g_hTeamSpawnPoints[i] = new ArrayList(3);  
     }
     
     // 重置rec文件夹选择
@@ -345,6 +359,16 @@ public void OnMapEnd()
     
     // 清理带包检测timer
     KillClientTimer(g_hBombCarrierCheckTimer);
+    
+    // 清理出生点数组
+    for (int i = 0; i < 4; i++)
+    {
+        if (g_hTeamSpawnPoints[i] != null)
+        {
+            delete g_hTeamSpawnPoints[i];
+            g_hTeamSpawnPoints[i] = null;
+        }
+    }
 }
 
 public void OnClientPostAdminCheck(int client)
@@ -482,6 +506,12 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
         // 延迟0.1秒
         CreateTimer(0.1, Timer_AssignC4AtFreezeStart, _, TIMER_FLAG_NO_MAPCHANGE);
     }
+
+    // 预分配玩家出生点
+    if (g_bRecFolderSelected)
+    {
+        PreAssignPlayerSpawns();
+    }
     
     // 清理旧的timer
     if (g_hBombCarrierCheckTimer != null)
@@ -503,14 +533,28 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
 {
     int client = GetClientOfUserId(event.GetInt("userid"));
     
-    if (!IsValidClient(client) || !IsFakeClient(client))
+    if (!IsValidClient(client))
         return;
     
-    g_iAssignedRecIndex[client] = -1;
-    g_bRecMoneySet[client] = false;
-    g_bInitialInventoryApplied[client] = false;
+    // Bot数据重置
+    if (IsFakeClient(client))
+    {
+        g_iAssignedRecIndex[client] = -1;
+        g_bRecMoneySet[client] = false;
+        g_bInitialInventoryApplied[client] = false;
+        return;
+    }
+    
+    // 应用预分配的出生点
+    if (g_bHasAssignedSpawn[client] && IsPlayerAlive(client))
+    {
+        // 检查是否在冻结时间内
+        if (GameRules_GetProp("m_bFreezePeriod"))
+        {
+            CreateTimer(0.01, Timer_TeleportPlayer, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+        }
+    }
 }
-
 // ============================================================================
 // OnPlayerRunCmd - 检测炸弹安装和敌人
 // ============================================================================
@@ -4446,6 +4490,9 @@ void LoadAllDemoData(const char[] szMap, const char[] szDemoFolder)
     
     // 加载money数据
     LoadMoneyDataFile(szDemoFolder);
+
+    // 加载出生点数据
+    LoadSpawnDataFile(szDemoFolder);
     
     PrintToServer("[Bot REC Cache] All data loaded successfully");
 }
@@ -4484,6 +4531,294 @@ void ClearAllCachedData()
         delete g_jMoneyData;
         g_jMoneyData = null;
     }
+
+    if (g_jSpawnData != null)
+    {
+        delete g_jSpawnData;
+        g_jSpawnData = null;
+    }
+}
+
+// ============================================================================
+// 出生点系统
+// ============================================================================
+
+/**
+ * 加载spawns.json到缓存
+ */
+bool LoadSpawnDataFile(const char[] szRecFolder)
+{
+    char szMap[64];
+    GetCurrentMap(szMap, sizeof(szMap));
+    GetMapDisplayName(szMap, szMap, sizeof(szMap));
+    
+    char szPath[PLATFORM_MAX_PATH];
+    BuildPath(Path_SM, szPath, sizeof(szPath), 
+        "data/botmimic/all/%s/%s/spawns.json", szMap, szRecFolder);
+    
+    if (!FileExists(szPath))
+    {
+        return false;
+    }
+    
+    if (g_jSpawnData != null)
+        delete g_jSpawnData;
+    
+    g_jSpawnData = JSONObject.FromFile(szPath);
+    
+    if (g_jSpawnData == null)
+        return false;
+    
+    // 加载所有可能的出生点
+    if (g_jSpawnData.HasKey("summary"))
+    {
+        JSONObject jSummary = view_as<JSONObject>(g_jSpawnData.Get("summary"));
+        
+        // 加载T方出生点
+        if (jSummary.HasKey("T"))
+        {
+            JSONObject jTeamT = view_as<JSONObject>(jSummary.Get("T"));
+            if (jTeamT.HasKey("positions"))
+            {
+                JSONArray jPositions = view_as<JSONArray>(jTeamT.Get("positions"));
+                
+                for (int i = 0; i < jPositions.Length; i++)
+                {
+                    char szPos[64];
+                    jPositions.GetString(i, szPos, sizeof(szPos));
+                    
+                    float pos[3];
+                    ParsePositionString(szPos, pos);
+                    g_hTeamSpawnPoints[CS_TEAM_T].PushArray(pos, 3);
+                }
+                
+                delete jPositions;
+            }
+            delete jTeamT;
+        }
+        
+        // 加载CT方出生点
+        if (jSummary.HasKey("CT"))
+        {
+            JSONObject jTeamCT = view_as<JSONObject>(jSummary.Get("CT"));
+            if (jTeamCT.HasKey("positions"))
+            {
+                JSONArray jPositions = view_as<JSONArray>(jTeamCT.Get("positions"));
+                
+                for (int i = 0; i < jPositions.Length; i++)
+                {
+                    char szPos[64];
+                    jPositions.GetString(i, szPos, sizeof(szPos));
+                    
+                    float pos[3];
+                    ParsePositionString(szPos, pos);
+                    g_hTeamSpawnPoints[CS_TEAM_CT].PushArray(pos, 3);
+                }
+                
+                delete jPositions;
+            }
+            delete jTeamCT;
+        }
+        
+        delete jSummary;
+    }
+    
+    return true;
+}
+
+/**
+ * 解析位置字符串 "x y z" -> float[3]
+ */
+void ParsePositionString(const char[] szPos, float pos[3])
+{
+    char szParts[3][32];
+    ExplodeString(szPos, " ", szParts, sizeof(szParts), sizeof(szParts[]));
+    
+    pos[0] = StringToFloat(szParts[0]);
+    pos[1] = StringToFloat(szParts[1]);
+    pos[2] = StringToFloat(szParts[2]);
+}
+
+/**
+ * 预分配真实玩家的出生点
+ */
+void PreAssignPlayerSpawns()
+{
+    if (g_jSpawnData == null)
+        return;
+    
+    // 获取当前回合已被bot使用的出生点
+    ArrayList hUsedSpawns[4];  
+    for (int i = 0; i < 4; i++)
+        hUsedSpawns[i] = new ArrayList(3);
+    
+    // 查找当前回合数据，收集bot使用的出生点
+    if (g_jSpawnData.HasKey("rounds"))
+    {
+        JSONArray jRounds = view_as<JSONArray>(g_jSpawnData.Get("rounds"));
+        
+        for (int i = 0; i < jRounds.Length; i++)
+        {
+            JSONObject jRound = view_as<JSONObject>(jRounds.Get(i));
+            int iRound = jRound.GetInt("round");
+            
+            // 找到当前回合
+            if (iRound == g_iCurrentRound + 1)
+            {
+                if (jRound.HasKey("spawns"))
+                {
+                    JSONArray jSpawns = view_as<JSONArray>(jRound.Get("spawns"));
+                    
+                    for (int j = 0; j < jSpawns.Length; j++)
+                    {
+                        JSONObject jSpawn = view_as<JSONObject>(jSpawns.Get(j));
+                        
+                        char szPlayerName[MAX_NAME_LENGTH];
+                        jSpawn.GetString("player_name", szPlayerName, sizeof(szPlayerName));
+                        
+                        // 先获取队伍信息
+                        char szTeam[4];
+                        jSpawn.GetString("team", szTeam, sizeof(szTeam));
+                        int iSpawnTeam = StrEqual(szTeam, "T", false) ? CS_TEAM_T : CS_TEAM_CT;
+                        
+                        // 检查这个rec名称是否在当前被分配使用
+                        bool isActiveBot = false;
+                        
+                        // 经济模式：检查分配列表
+                        if (g_bEconomyBasedSelection)
+                        {
+                            if (g_hAssignedRecsForTeam[iSpawnTeam] != null)
+                            {
+                                for (int r = 0; r < g_hAssignedRecsForTeam[iSpawnTeam].Length; r++)
+                                {
+                                    char szAssignedRec[PLATFORM_MAX_PATH];
+                                    g_hAssignedRecsForTeam[iSpawnTeam].GetString(r, szAssignedRec, sizeof(szAssignedRec));
+                                    
+                                    if (StrEqual(szPlayerName, szAssignedRec, false))
+                                    {
+                                        isActiveBot = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // 全局模式：所有在当前回合配置中的bot都算使用中
+                        else
+                        {
+                            isActiveBot = true;
+                        }
+                        
+                        // 记录使用中的出生点
+                        if (isActiveBot)
+                        {
+                            char szPos[64];
+                            jSpawn.GetString("position", szPos, sizeof(szPos));
+                            
+                            float pos[3];
+                            ParsePositionString(szPos, pos);
+                            hUsedSpawns[iSpawnTeam].PushArray(pos, 3);
+                        }
+                        
+                        delete jSpawn;
+                    }
+                    
+                    delete jSpawns;
+                }
+                
+                delete jRound;
+                break;
+            }
+            
+            delete jRound;
+        }
+        
+        delete jRounds;
+    }
+    
+    // 为每个真实玩家分配出生点
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!IsValidClient(client) || IsFakeClient(client))
+            continue;
+        
+        int iTeam = GetClientTeam(client);
+        if (iTeam != CS_TEAM_T && iTeam != CS_TEAM_CT)
+            continue;
+        
+        // 从所有出生点中找一个未被使用的
+        bool foundSpawn = false;
+        
+        for (int i = 0; i < g_hTeamSpawnPoints[iTeam].Length; i++)
+        {
+            float spawnPos[3];
+            g_hTeamSpawnPoints[iTeam].GetArray(i, spawnPos, 3);
+            
+            // 检查这个出生点是否已被bot使用
+            bool isUsed = false;
+            for (int j = 0; j < hUsedSpawns[iTeam].Length; j++)
+            {
+                float usedPos[3];
+                hUsedSpawns[iTeam].GetArray(j, usedPos, 3);
+                
+                // 如果距离小于10单位，认为是同一个出生点
+                float dist = GetVectorDistance(spawnPos, usedPos);
+                if (dist < 10.0)
+                {
+                    isUsed = true;
+                    break;
+                }
+            }
+            
+            // 找到未使用的出生点
+            if (!isUsed)
+            {
+                g_fAssignedSpawnPos[client][0] = spawnPos[0];
+                g_fAssignedSpawnPos[client][1] = spawnPos[1];
+                g_fAssignedSpawnPos[client][2] = spawnPos[2];
+                g_bHasAssignedSpawn[client] = true;
+                foundSpawn = true;
+                break;
+            }
+        }
+        
+        // 如果没有找到未使用的出生点，标记为false
+        if (!foundSpawn)
+        {
+            g_bHasAssignedSpawn[client] = false;
+        }
+    }
+    
+    // 清理
+    for (int i = 0; i < 4; i++)
+        delete hUsedSpawns[i];
+}
+
+/**
+ * 传送玩家到预分配的位置
+ */
+public Action Timer_TeleportPlayer(Handle hTimer, any iUserId)
+{
+    int client = GetClientOfUserId(iUserId);
+    
+    if (!IsValidClient(client) || !IsPlayerAlive(client))
+        return Plugin_Stop;
+    
+    if (!g_bHasAssignedSpawn[client])
+        return Plugin_Stop;
+    
+    // 获取当前位置
+    float currentPos[3];
+    GetClientAbsOrigin(client, currentPos);
+    
+    // 只修改XY，保持当前Z高度
+    float newPos[3];
+    newPos[0] = g_fAssignedSpawnPos[client][0];  
+    newPos[1] = g_fAssignedSpawnPos[client][1];  
+    newPos[2] = currentPos[2];                 
+    
+    TeleportEntity(client, newPos, NULL_VECTOR, NULL_VECTOR);
+    
+    return Plugin_Stop;
 }
 
 /**
