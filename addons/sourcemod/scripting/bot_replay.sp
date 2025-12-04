@@ -18,7 +18,7 @@ public Plugin myinfo =
 	name = "Bot Replay", 
 	author = "Tasty cup", 
 	description = "Play recordings for bots at round start", 
-	version = "1.1.3", 
+	version = "1.1.4", 
 	url = ""
 };
 
@@ -4794,7 +4794,7 @@ void PreAssignPlayerSpawns()
 }
 
 /**
- * 传送玩家到预分配的位置
+ * 传送玩家到预分配的位置(自动匹配地面高度)
  */
 public Action Timer_TeleportPlayer(Handle hTimer, any iUserId)
 {
@@ -4806,19 +4806,55 @@ public Action Timer_TeleportPlayer(Handle hTimer, any iUserId)
     if (!g_bHasAssignedSpawn[client])
         return Plugin_Stop;
     
-    // 获取当前位置
-    float currentPos[3];
-    GetClientAbsOrigin(client, currentPos);
+    // 使用配置的XY坐标,从高处向下追踪找到地面
+    float traceStart[3];
+    traceStart[0] = g_fAssignedSpawnPos[client][0];  
+    traceStart[1] = g_fAssignedSpawnPos[client][1];  
+    traceStart[2] = g_fAssignedSpawnPos[client][2] + 100.0; 
     
-    // 只修改XY，保持当前Z高度
-    float newPos[3];
-    newPos[0] = g_fAssignedSpawnPos[client][0];  
-    newPos[1] = g_fAssignedSpawnPos[client][1];  
-    newPos[2] = currentPos[2];                 
+    float traceEnd[3];
+    traceEnd[0] = traceStart[0];
+    traceEnd[1] = traceStart[1];
+    traceEnd[2] = traceStart[2] - 200.0;  // 向下追踪200单位
     
-    TeleportEntity(client, newPos, NULL_VECTOR, NULL_VECTOR);
+    Handle hTrace = TR_TraceRayFilterEx(traceStart, traceEnd, MASK_PLAYERSOLID, RayType_EndPoint, TraceFilter_World);
+    
+    if (TR_DidHit(hTrace))
+    {
+        float groundPos[3];
+        TR_GetEndPosition(groundPos, hTrace);
+        
+        // 地面位置+1单位避免卡地
+        groundPos[2] += 1.0;
+        
+        TeleportEntity(client, groundPos, NULL_VECTOR, NULL_VECTOR);
+    }
+    else
+    {
+        // 如果追踪失败,使用原坐标但保持当前高度
+        float currentPos[3];
+        GetClientAbsOrigin(client, currentPos);
+        
+        float newPos[3];
+        newPos[0] = g_fAssignedSpawnPos[client][0];
+        newPos[1] = g_fAssignedSpawnPos[client][1];
+        newPos[2] = currentPos[2];
+        
+        TeleportEntity(client, newPos, NULL_VECTOR, NULL_VECTOR);
+    }
+    
+    CloseHandle(hTrace);
     
     return Plugin_Stop;
+}
+
+/**
+ * 射线追踪过滤器 - 检测世界几何体
+ */
+public bool TraceFilter_World(int entity, int contentsMask)
+{
+    // 追踪世界实体(entity 0)
+    return (entity == 0);
 }
 
 /**
