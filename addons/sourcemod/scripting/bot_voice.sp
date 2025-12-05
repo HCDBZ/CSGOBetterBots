@@ -9,7 +9,7 @@ public Plugin myinfo =
     name = "Bot Voice",
     author = "Tasty cup",
     description = "Makes bots play voice audio with multi-track support",
-    version = "1.0.2",
+    version = "1.1.0",
     url = ""
 };
 
@@ -101,7 +101,7 @@ int StartSpeaking(int client, const char[] voiceFile, float duration)
     track.trackId = g_iNextTrackId[client]++;
     
     // 立即播放音频
-    PlayVoiceToTeam(client, voiceFile);
+    PlayVoiceToTeam(client, voiceFile, duration);
     
     // 创建自动停止定时器
     DataPack pack = new DataPack();
@@ -182,9 +182,13 @@ void ClearAllVoiceTracks(int client)
 }
 
 // 播放语音给同队玩家
-void PlayVoiceToTeam(int client, const char[] voiceFile)
+void PlayVoiceToTeam(int client, const char[] voiceFile, float duration)
 {
     int speakerTeam = GetClientTeam(client);
+    
+    int[] targets = new int[MaxClients];
+    int targetCount = 0;
+    
     for (int i = 1; i <= MaxClients; i++)
     {
         if (!IsClientInGame(i))
@@ -192,10 +196,13 @@ void PlayVoiceToTeam(int client, const char[] voiceFile)
         if (GetClientTeam(i) != speakerTeam)
             continue;
         
+        targets[targetCount++] = i;
+        
+        // 改用独立的音频播放，不受语音系统干扰
         EmitSoundToClient(i, voiceFile, 
-            SOUND_FROM_LOCAL_PLAYER,  
-            SNDCHAN_AUTO,             
-            SNDLEVEL_NONE,         
+            SOUND_FROM_LOCAL_PLAYER,  // 改回本地播放源
+            SNDCHAN_AUTO,             // 使用自动通道，避免语音通道冲突
+            SNDLEVEL_NONE,            // 无衰减
             SND_NOFLAGS,           
             1.0,     
             SNDPITCH_NORMAL,        
@@ -205,10 +212,25 @@ void PlayVoiceToTeam(int client, const char[] voiceFile)
             true,                    
             0.0);
     }
+    
+    if (targetCount == 0)
+        return;
+    
+    // 只用 RawAudio 显示图标
+    Handle hMsg = StartMessage("RawAudio", targets, targetCount, USERMSG_RELIABLE);
+    
+    if (hMsg != INVALID_HANDLE)
+    {
+        PbSetInt(hMsg, "pitch", 100);
+        PbSetInt(hMsg, "entidx", client);
+        PbSetFloat(hMsg, "duration", duration);
+        PbSetString(hMsg, "voice_filename", "");  // 空文件名，只显示图标
+        
+        EndMessage();
+    }
 }
 
 // 停止语音播放
- 
 void StopVoiceSound(int client, const char[] voiceFile)
 {
     int speakerTeam = GetClientTeam(client);
