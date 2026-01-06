@@ -18,7 +18,7 @@ public Plugin myinfo =
 	name = "Bot Replay", 
 	author = "Tasty cup", 
 	description = "Play recordings for bots at round start", 
-	version = "1.1.4", 
+	version = "1.2.0", 
 	url = ""
 };
 
@@ -39,11 +39,18 @@ enum BotState
     BotState_PlayingREC      // 正在播放REC
 }
 
-// 回合选择模式 (默认)
+// 回合选择模式 
 enum RoundSelectionMode
 {
     Round_FullMatch = 0,    // 全局回合模式（按当前回合播放）
     Round_Economy          // 经济回合模式（根据经济选择）
+}
+
+// 回放模式
+enum PlaybackMode
+{
+    Playback_Full = 0,      // 完整回合模式(从回合开始播放)
+    Playback_PreGame = 1    // 赛前模式(冻结时间前1秒播放)
 }
 
 // 经济选择模式
@@ -81,6 +88,7 @@ enum struct RoundCandidate
 
 // Bot状态
 bool g_bPlayingRoundStartRec[MAXPLAYERS+1];           // 是否正在播放REC
+bool g_bPurchaseSystemActive[MAXPLAYERS+1];           // 购买系统是否激活
 char g_szRoundStartRecPath[MAXPLAYERS+1][PLATFORM_MAX_PATH];  // REC路径
 char g_szCurrentRecName[MAXPLAYERS+1][PLATFORM_MAX_PATH];     // 当前REC文件名
 char g_szAssignedRecName[MAXPLAYERS+1][PLATFORM_MAX_PATH];    // 经济模式下分配的REC名称
@@ -103,6 +111,7 @@ bool g_bBombPlantedThisRound = false;                 // 本回合是否已下�
 // 模式设置
 RoundSelectionMode g_iRoundMode = Round_Economy;     // 回合选择模式
 EconomySelectionMode g_iEconomyMode = Economy_SingleTeam;  // 经济选择模式
+PlaybackMode g_iPlaybackMode = Playback_Full;         // 回放模式
 int g_iSelectedRoundForTeam[4] = {-1, ...};           // 每个阵营选择的回合数
 bool g_bEconomyBasedSelection = false;                // 标记是否使用经济模式选择
 char g_szSelectedDemoForTeam[4][PLATFORM_MAX_PATH];   // 每个阵营选择的demo文件夹
@@ -134,6 +143,7 @@ float g_BotShared_EnemyCacheTime[MAXPLAYERS+1] = {0.0, ...};  // 缓存时间
 // ConVars
 ConVar g_cvEconomyMode;
 ConVar g_cvRoundMode;
+ConVar g_cvPlaybackMode;
 
 // 武器数据表 
 StringMap g_hWeaponPrices;
@@ -184,6 +194,7 @@ ArrayList g_hFinalInventory[MAXPLAYERS+1];        // 每个bot应该拥有的最
 ArrayList g_hInitialInventory[MAXPLAYERS+1];      // 每个bot回合开始的初始装备
 bool g_bInitialInventoryApplied[MAXPLAYERS+1];    // 初始装备是否已应用
 bool g_bAllowPurchase[MAXPLAYERS+1];              // 标记是否允许购买（用于区分系统购买和手动购买）
+float g_fRoundStartGameTime = 0.0;                // 记录回合开始的GameTime
 
 // 带包检测
 Handle g_hBombCarrierCheckTimer = null;              // 带包检测timer
@@ -191,6 +202,34 @@ Handle g_hBombCarrierCheckTimer = null;              // 带包检测timer
 // 伤害检测
 int g_iLastAttacker[MAXPLAYERS+1];                // 上次攻击者
 int g_iLastDamageType[MAXPLAYERS+1];              // 上次伤害类型
+
+// 购买优先级
+int GetItemBuyPriority(const char[] szItem)
+{
+    // 道具工具
+    if (StrEqual(szItem, "smokegrenade") || StrEqual(szItem, "flashbang") || 
+        StrEqual(szItem, "hegrenade") || StrEqual(szItem, "molotov") || 
+        StrEqual(szItem, "incgrenade") || StrEqual(szItem, "decoy"))
+        return 1;
+    
+    // 护甲
+    if (StrEqual(szItem, "vest") || StrEqual(szItem, "vesthelm"))
+        return 2;
+    
+    // 拆弹器
+    if (StrEqual(szItem, "defuser"))
+        return 3;
+    
+    // 副武器
+    if (StrEqual(szItem, "deagle") || StrEqual(szItem, "p250") || 
+        StrEqual(szItem, "tec9") || StrEqual(szItem, "fn57") || 
+        StrEqual(szItem, "cz75a") || StrEqual(szItem, "elite") || 
+        StrEqual(szItem, "revolver"))
+        return 4;
+    
+    // 主武器 
+    return 5;
+}
 
 // ============================================================================
 // 插件生命周期
@@ -213,10 +252,14 @@ public void OnPluginStart()
     // 创建ConVars
     g_cvEconomyMode = CreateConVar("sm_botrec_economy_mode", "0", 
         "Economy selection mode: 0=Single Team (default), 1=Both Teams", 
-        FCVAR_NOTIFY, true, 0.0, true, 1.0);  // 范围 0-1
+        FCVAR_NOTIFY, true, 0.0, true, 1.0);  
     
     g_cvRoundMode = CreateConVar("sm_botrec_round_mode", "0", 
         "Round selection mode: 0=Full Match (default), 1=Economy Based", 
+        FCVAR_NOTIFY, true, 0.0, true, 1.0);
+
+    g_cvPlaybackMode = CreateConVar("sm_botrec_playback_mode", "0",
+        "Playback mode: 0=Full Round (default), 1=PreGame (start 1s before freeze ends)",
         FCVAR_NOTIFY, true, 0.0, true, 1.0);
     
     // 注册管理员命令
@@ -230,7 +273,10 @@ public void OnPluginStart()
         "Show current bot REC status");
 
     RegAdminCmd("sm_botrec_debug", Command_DebugInfo, ADMFLAG_GENERIC, 
-        "Show detailed debug information");      
+        "Show detailed debug information");     
+
+    RegAdminCmd("sm_botrec_playback", Command_SetPlaybackMode, ADMFLAG_GENERIC,
+        "Set playback mode: 0=Full, 1=PreGame"); 
 
     RegAdminCmd("sm_botrec_select", Command_SelectDemo, ADMFLAG_GENERIC,
         "Select specific demo folder");          
@@ -253,6 +299,7 @@ public void OnPluginStart()
         g_bAllowPurchase[i] = false;
         g_hInitialInventory[i] = null;
         g_bInitialInventoryApplied[i] = false;
+        g_bPurchaseSystemActive[i] = false;
 
         // 初始化聊天数据 
         g_hChatTimer[i] = null;
@@ -396,9 +443,47 @@ public void Event_RoundPreStart(Event event, const char[] name, bool dontBroadca
 
 public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
 {
+    // 记录回合开始时间
+    g_fRoundStartGameTime = GetGameTime();
+
+    // 清理所有玩家的出生点分配
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        g_bHasAssignedSpawn[i] = false;
+    }
+
+    // 清理所有bot上一回合的语音
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsValidClient(i) && IsFakeClient(i))
+        {
+            KillClientTimer(g_hVoiceTimer[i]);
+            
+            if (BotVoice_IsSpeaking(i))
+            {
+                BotVoice_StopAllSpeaking(i);
+            }
+            
+            if (g_hVoiceActions[i] != null)
+            {
+                delete g_hVoiceActions[i];
+                g_hVoiceActions[i] = null;
+            }
+            
+            if (g_hVoiceFiles[i] != null)
+            {
+                delete g_hVoiceFiles[i];
+                g_hVoiceFiles[i] = null;
+            }
+            
+            g_iVoiceActionIndex[i] = 0;
+        }
+    }  
+
     BotShared_ResetBombState();
     
     // 从 ConVar 读取当前模式
+    g_iPlaybackMode = view_as<PlaybackMode>(g_cvPlaybackMode.IntValue);
     g_iEconomyMode = view_as<EconomySelectionMode>(g_cvEconomyMode.IntValue);
     g_iRoundMode = view_as<RoundSelectionMode>(g_cvRoundMode.IntValue);
     
@@ -512,6 +597,21 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     {
         PreAssignPlayerSpawns();
     }
+
+    // pregame模式下的播放逻辑
+    if (g_iPlaybackMode == Playback_PreGame && g_bRecFolderSelected)
+    {
+        CreateTimer(0.0, Timer_InstantPlayForPosition, _, TIMER_FLAG_NO_MAPCHANGE);
+        
+        ConVar cvFreezeTime = FindConVar("mp_freezetime");
+        float fFreezeTime = (cvFreezeTime != null) ? cvFreezeTime.FloatValue : 15.0;
+        float fStartDelay = fFreezeTime - 1.0;
+        
+        if (fStartDelay < 0.1)
+            fStartDelay = 0.1;
+        
+        CreateTimer(fStartDelay, Timer_StartAllBotsPlayback, _, TIMER_FLAG_NO_MAPCHANGE);
+    }
     
     // 清理旧的timer
     if (g_hBombCarrierCheckTimer != null)
@@ -542,13 +642,18 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
         g_iAssignedRecIndex[client] = -1;
         g_bRecMoneySet[client] = false;
         g_bInitialInventoryApplied[client] = false;
+        
+        if (g_iPlaybackMode == Playback_PreGame && g_bPlayingRoundStartRec[client])
+        {
+            return;
+        }
+        
         return;
     }
     
     // 应用预分配的出生点
     if (g_bHasAssignedSpawn[client] && IsPlayerAlive(client))
     {
-        // 检查是否在冻结时间内
         if (GameRules_GetProp("m_bFreezePeriod"))
         {
             CreateTimer(0.01, Timer_TeleportPlayer, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
@@ -776,14 +881,25 @@ void AssignAndPlayRec(int client)
             g_bRecMoneySet[client] = true;
         }
         
-        // 加载购买数据
-        bool bPurchaseLoaded = LoadPurchaseActionsForBot(client, iRoundToUse);
+        // 根据模式选择购买系统
+        bool bPurchaseLoaded = false;
+        if (g_iPlaybackMode == Playback_PreGame)
+        {
+            bPurchaseLoaded = LoadPreGamePurchaseList(client, iRoundToUse);
+        }
+        else
+        {
+            bPurchaseLoaded = LoadPurchaseActionsForBot(client, iRoundToUse);
+        }
         
         if (bPurchaseLoaded)
         {
+            // 拦截bot的默认购买
+            g_bPurchaseSystemActive[client] = true;
+            
             // 清理旧的购买timer
             KillClientTimer(g_hPurchaseTimer[client]);
-            
+
             // 创建购买执行timer
             DataPack pack = new DataPack();
             pack.WriteCell(GetClientUserId(client));
@@ -819,26 +935,17 @@ void AssignAndPlayRec(int client)
             pack.WriteCell(GetClientUserId(client));
             g_hVoiceTimer[client] = CreateTimer(0.1, Timer_ExecuteVoiceAction, pack, 
                 TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
-    
-            PrintToServer("[Voice] Created voice timer for %s", szBotName); 
+        }
+
+        
+        // 根据模式决定播放时机
+        if (g_iPlaybackMode == Playback_PreGame)
+        {
         }
         else
         {
-            PrintToServer("[Voice] Failed to load voice for %s", szBotName); 
+            StartBotRecPlayback(client);
         }
-        
-        // 开始播放REC
-        g_bPlayingRoundStartRec[client] = true;
-        float fGameTime = GetGameTime();
-        g_fRecStartTime[client] = fGameTime;
-        
-        BotMimic_PlayRecordFromFile(client, szRecPath);
-        
-        // Hook伤害
-        SDKHook(client, SDKHook_OnTakeDamage, OnTakeDamage);
-
-        // 设置Bot状态为播放REC
-        BotShared_SetBotState(client, BotState_PlayingREC);
     }
 }
 
@@ -848,8 +955,11 @@ void AssignAndPlayRec(int client)
 
 bool SelectRandomRecFolder(const char[] szMap)
 {
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szMapBasePath[PLATFORM_MAX_PATH];
-    BuildPath(Path_SM, szMapBasePath, sizeof(szMapBasePath), "data/botmimic/all/%s", szMap);
+    BuildPath(Path_SM, szMapBasePath, sizeof(szMapBasePath), "data/botmimic/%s/%s", szModeBase, szMap);
     
     if (!DirExists(szMapBasePath))
         return false;
@@ -916,9 +1026,12 @@ bool GetRoundStartRec(int client, int iRound, char[] szPath, int iMaxLen)
         return false;
     }
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szRoundPath[PLATFORM_MAX_PATH];
-    BuildPath(Path_SM, szRoundPath, sizeof(szRoundPath), "data/botmimic/all/%s/%s/round%d/%s", 
-        szMap, szUseDemoFolder, iRound + 1, szTeamName);
+    BuildPath(Path_SM, szRoundPath, sizeof(szRoundPath), "data/botmimic/%s/%s/%s/round%d/%s", 
+        szModeBase, szMap, szUseDemoFolder, iRound + 1, szTeamName);
     
     if (!DirExists(szRoundPath))
         return false;
@@ -1168,7 +1281,7 @@ void SelectRoundByEconomy(int iTeam)
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
     char szMapBasePath[PLATFORM_MAX_PATH];
-    BuildPath(Path_SM, szMapBasePath, sizeof(szMapBasePath), "data/botmimic/all/%s", szMap);
+    BuildPath(Path_SM, szMapBasePath, sizeof(szMapBasePath), "data/botmimic/%s/%s", szMap);
     
     if (!DirExists(szMapBasePath))
     {
@@ -1562,7 +1675,7 @@ int SelectRoundByBothTeamsEconomy()
     
     // 获取所有demo文件夹
     char szMapBasePath[PLATFORM_MAX_PATH];
-    BuildPath(Path_SM, szMapBasePath, sizeof(szMapBasePath), "data/botmimic/all/%s", szMap);
+    BuildPath(Path_SM, szMapBasePath, sizeof(szMapBasePath), "data/botmimic/%s/%s", szMap);
     
     if (!DirExists(szMapBasePath))
     {
@@ -2022,9 +2135,12 @@ bool LoadPurchaseDataFile(const char[] szRecFolder)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szPath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szPath, sizeof(szPath), 
-        "data/botmimic/all/%s/%s/purchases.json", szMap, szRecFolder);
+        "data/botmimic/%s/%s/%s/purchases.json", szModeBase, szMap, szRecFolder);
     
     if (!FileExists(szPath))
     {
@@ -2046,9 +2162,12 @@ bool LoadPurchaseDataFile(const char[] szRecFolder)
 
 bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder, float fFreezeTimes[31], bool bValid[31])
 {
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szFreezePath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szFreezePath, sizeof(szFreezePath), 
-        "data/botmimic/all/%s/%s/freeze.txt", szMap, szRecFolder);
+        "data/botmimic/%s/%s/%s/freeze.txt", szModeBase, szMap, szRecFolder);
     
     PrintToServer("[Freeze Loader] Loading freeze times from: %s", szFreezePath);
     
@@ -2202,8 +2321,8 @@ bool LoadFreezeTimes(const char[] szMap, const char[] szRecFolder, float fFreeze
     PrintToServer("[Freeze Loader] Loaded %d rounds for pause, %d rounds for economy", 
         iValidRoundsForPause, iValidRoundsForEconomy);
     
-    // 全局模式下，直接设置服务器冻结时间
-    if (g_iRoundMode == Round_FullMatch && g_fStandardFreezeTime > 0.0)
+    // 全局模式才设置服务器冻结时间
+    if (g_iRoundMode == Round_FullMatch && g_iPlaybackMode == Playback_Full && g_fStandardFreezeTime > 0.0)
     {
         ServerCommand("mp_freezetime %.2f", g_fStandardFreezeTime);
         PrintToServer("[Freeze Loader] Set server freeze time to %.2f seconds", g_fStandardFreezeTime);
@@ -2219,9 +2338,12 @@ bool LoadChatDataFile(const char[] szRecFolder)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szPath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szPath, sizeof(szPath), 
-        "data/botmimic/all/%s/%s/chat.json", szMap, szRecFolder);
+        "data/botmimic/%s/%s/%s/chat.json", szModeBase, szMap, szRecFolder);
     
     if (!FileExists(szPath))
     {
@@ -2324,13 +2446,18 @@ public Action CS_OnBuyCommand(int client, const char[] szWeapon)
 {
     if (!IsValidClient(client) || !IsFakeClient(client))
         return Plugin_Continue;
-    
+
     if (g_bAllowPurchase[client])
     {
         g_bAllowPurchase[client] = false;
         return Plugin_Continue;
     }
-    
+
+    if (g_bPurchaseSystemActive[client])
+    {
+        return Plugin_Handled;
+    }
+
     if (g_bPlayingRoundStartRec[client])
     {
         return Plugin_Handled;
@@ -2339,7 +2466,205 @@ public Action CS_OnBuyCommand(int client, const char[] szWeapon)
     return Plugin_Continue;
 }
 
-// 加载购买动作
+
+// 购买优先级排序
+public int SortByBuyPriority(int idx1, int idx2, Handle array, Handle hndl)
+{
+    ArrayList list = view_as<ArrayList>(array);
+    
+    char item1[128], item2[128];
+    list.GetString(idx1, item1, sizeof(item1));
+    list.GetString(idx2, item2, sizeof(item2));
+    
+    char parts1[3][64], parts2[3][64];
+    ExplodeString(item1, "|", parts1, 3, 64);
+    ExplodeString(item2, "|", parts2, 3, 64);
+    
+    int priority1 = GetItemBuyPriority(parts1[1]);
+    int priority2 = GetItemBuyPriority(parts2[1]);
+    
+    if (priority1 < priority2) return -1;
+    if (priority1 > priority2) return 1;
+    
+    return 0;
+}
+
+// PreGame模式加载购买动作
+bool LoadPreGamePurchaseList(int client, int iRound)
+{
+    if (IsInWarmup())
+        return false;
+
+    char szMap[64];
+    GetCurrentMap(szMap, sizeof(szMap));
+    GetMapDisplayName(szMap, szMap, sizeof(szMap));
+    
+    JSONObject jUsePurchaseData = null;
+    
+    if (g_szBotRecFolder[client][0] != '\0')
+    {
+        jUsePurchaseData = LoadPurchaseDataForDemo(szMap, g_szBotRecFolder[client]);
+    }
+    
+    if (jUsePurchaseData == null)
+        jUsePurchaseData = g_jPurchaseData;
+    
+    if (jUsePurchaseData == null)
+        return false;
+    
+    int iClientTeam = GetClientTeam(client);
+    char szTeamName[4];
+    
+    if (iClientTeam == CS_TEAM_T)
+        strcopy(szTeamName, sizeof(szTeamName), "T");
+    else if (iClientTeam == CS_TEAM_CT)
+        strcopy(szTeamName, sizeof(szTeamName), "CT");
+    else
+        return false;
+    
+    char szRoundKey[32];
+    Format(szRoundKey, sizeof(szRoundKey), "round%d", iRound + 1);
+    
+    if (!jUsePurchaseData.HasKey(szRoundKey))
+    {
+        if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+            delete jUsePurchaseData;
+        return false;
+    }
+    
+    JSONObject jRound = view_as<JSONObject>(jUsePurchaseData.Get(szRoundKey));
+    if (jRound == null || !jRound.HasKey(szTeamName))
+    {
+        if (jRound != null) delete jRound;
+        if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+            delete jUsePurchaseData;
+        return false;
+    }
+    
+    JSONObject jTeam = view_as<JSONObject>(jRound.Get(szTeamName));
+    if (jTeam == null)
+    {
+        delete jRound;
+        if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+            delete jUsePurchaseData;
+        return false;
+    }
+    
+    if (g_szCurrentRecName[client][0] == '\0')
+    {
+        delete jTeam;
+        delete jRound;
+        if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+            delete jUsePurchaseData;
+        return false;
+    }
+    
+    if (!jTeam.HasKey(g_szCurrentRecName[client]))
+    {
+        delete jTeam;
+        delete jRound;
+        if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+            delete jUsePurchaseData;
+        return false;
+    }
+    
+    // 读取物品数组
+    JSONArray jItems = view_as<JSONArray>(jTeam.Get(g_szCurrentRecName[client]));
+    if (jItems == null)
+    {
+        delete jTeam;
+        delete jRound;
+        if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+            delete jUsePurchaseData;
+        return false;
+    }
+    
+    // 清理旧数据
+    if (g_hPurchaseActions[client] != null)
+        delete g_hPurchaseActions[client];
+    
+    g_hPurchaseActions[client] = new ArrayList(ByteCountToCells(128));
+    g_iPurchaseActionIndex[client] = 0;
+    g_bInitialInventoryApplied[client] = false;
+    
+    int iItemCount = jItems.Length;
+    if (iItemCount == 0)
+    {
+        delete jItems;
+        delete jTeam;
+        delete jRound;
+        if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+            delete jUsePurchaseData;
+        return false;
+    }
+    
+    // 获取冻结时间
+    ConVar cvFreezeTime = FindConVar("mp_freezetime");
+    float fFreezeTime = (cvFreezeTime != null) ? cvFreezeTime.FloatValue : 15.0;
+    
+    // 购买总时间
+    float fTotalBuyTime = float(iItemCount) * 0.2;
+    
+    // 随机选择开始时间，确保能在冻结时间内完成
+    float fMaxStartTime = fFreezeTime - fTotalBuyTime - 0.5; // 预留0.5秒
+    if (fMaxStartTime < 0.1)
+        fMaxStartTime = 0.1;
+    
+    float fStartTime = GetRandomFloat(0.1, fMaxStartTime);
+    
+    // 生成购买序列
+    int iClientTeamInt = GetClientTeam(client);
+    for (int i = 0; i < iItemCount; i++)
+    {
+        char szItem[64];
+        jItems.GetString(i, szItem, sizeof(szItem));
+        
+        if (IsDefaultPistol(szItem))
+            continue;
+        
+        // 转换阵营武器
+        char szBuyItem[64];
+        GetTeamSpecificWeapon(szItem, iClientTeamInt, szBuyItem, sizeof(szBuyItem));
+        
+        // 计算这个物品的购买时间
+        float fBuyTime = fStartTime + (float(i) * 0.2);
+        
+        // 构建购买动作字符串
+        char szActionStr[128];
+        Format(szActionStr, sizeof(szActionStr), "%.1f|%s|unknown", fBuyTime, szBuyItem);
+        g_hPurchaseActions[client].PushString(szActionStr);
+    }
+    
+    if (g_hPurchaseActions[client].Length > 0)
+    {
+        g_hPurchaseActions[client].SortCustom(SortByBuyPriority);
+        
+        // 重新分配购买时间
+        for (int i = 0; i < g_hPurchaseActions[client].Length; i++)
+        {
+            char szAction[128];
+            g_hPurchaseActions[client].GetString(i, szAction, sizeof(szAction));
+            
+            char szParts[3][64];
+            ExplodeString(szAction, "|", szParts, 3, 64);
+            
+            // 更新时间
+            float fNewTime = fStartTime + (float(i) * 0.2);
+            Format(szAction, sizeof(szAction), "%.1f|%s|%s", fNewTime, szParts[1], szParts[2]);
+            g_hPurchaseActions[client].SetString(i, szAction);
+        }
+    }
+    
+    delete jItems;
+    delete jTeam;
+    delete jRound;
+    if (jUsePurchaseData != g_jPurchaseData && jUsePurchaseData != null)
+        delete jUsePurchaseData;
+    
+    return true;
+}
+
+// 普通模式加载购买动作
 bool LoadPurchaseActionsForBot(int client, int iRound)
 {
     if (IsInWarmup())
@@ -2614,7 +2939,7 @@ bool LoadPurchaseActionsForBot(int client, int iRound)
         delete jUsePurchaseData;
     }
     
-    return (iPurchaseCount > 0 || iInitialCount > 0);
+    return true;
 }
 
 // 执行购买动作的定时器
@@ -2632,30 +2957,40 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
     
     if (!IsValidClient(client) || !IsPlayerAlive(client) || !IsFakeClient(client))
     {
-        g_hPurchaseTimer[client] = null;  
+        g_hPurchaseTimer[client] = null;
+        g_bPurchaseSystemActive[client] = false; 
         delete pack;
         return Plugin_Stop;
     }
     
-    if (!g_bPlayingRoundStartRec[client])
+    if (!g_bPurchaseSystemActive[client])
     {
-        g_hPurchaseTimer[client] = null;  
+        g_hPurchaseTimer[client] = null;
         delete pack;
         return Plugin_Stop;
     }
     
     if (g_hPurchaseActions[client] == null)
     {
-        g_hPurchaseTimer[client] = null;  
+        g_hPurchaseTimer[client] = null;
+        g_bPurchaseSystemActive[client] = false; 
         delete pack;
         return Plugin_Stop;
     }
     
     bool bInBuyZone = !!GetEntProp(client, Prop_Send, "m_bInBuyZone");
-    float fCurrentTime = GetGameTime() - g_fRecStartTime[client];
-    
     if (!bInBuyZone)
         return Plugin_Continue;
+    
+    float fCurrentTime;
+    if (g_iPlaybackMode == Playback_PreGame)
+    {
+        fCurrentTime = GetGameTime() - GetRoundStartTime();
+    }
+    else
+    {
+        fCurrentTime = GetGameTime() - g_fRecStartTime[client];
+    }
     
     while (g_iPurchaseActionIndex[client] < g_hPurchaseActions[client].Length)
     {
@@ -2680,7 +3015,7 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
         strcopy(szOriginalItem, sizeof(szOriginalItem), szParts[1]);
         strcopy(szSlot, sizeof(szSlot), szParts[2]);
         
-        if (ShouldSkipPurchase(client, szOriginalItem))
+        if (g_iPlaybackMode != Playback_PreGame && ShouldSkipPurchase(client, szOriginalItem))
         {
             g_iPurchaseActionIndex[client]++;
             continue;
@@ -2708,7 +3043,8 @@ public Action Timer_ExecutePurchaseAction(Handle hTimer, DataPack pack)
     
     if (g_iPurchaseActionIndex[client] >= g_hPurchaseActions[client].Length)
     {
-        g_hPurchaseTimer[client] = null; 
+        g_hPurchaseTimer[client] = null;
+        g_bPurchaseSystemActive[client] = false; 
         delete pack;
         return Plugin_Stop;
     }
@@ -3182,7 +3518,13 @@ public Action Command_SetRoundMode(int client, int args)
 
 public Action Command_ShowStatus(int client, int args)
 {
-    char szEconomyMode[64], szRoundMode[64];
+    char szEconomyMode[64], szRoundMode[64], szPlaybackMode[64];
+    
+    switch (g_iPlaybackMode)
+    {
+        case Playback_Full: strcopy(szPlaybackMode, sizeof(szPlaybackMode), "Full Round");
+        case Playback_PreGame: strcopy(szPlaybackMode, sizeof(szPlaybackMode), "PreGame");
+    }
     
     switch (g_iEconomyMode)
     {
@@ -3197,6 +3539,7 @@ public Action Command_ShowStatus(int client, int args)
     }
     
     ReplyToCommand(client, "[Bot REC] ===== Status =====");
+    ReplyToCommand(client, "  Playback Mode: %s", szPlaybackMode);
     ReplyToCommand(client, "  Round Mode: %s", szRoundMode);
     ReplyToCommand(client, "  Economy Mode: %s", szEconomyMode);
     ReplyToCommand(client, "  Current Round: %d", g_iCurrentRound);
@@ -3349,6 +3692,7 @@ void CleanupClientTimers(int client)
     }
     
     g_bInitialInventoryApplied[client] = false;
+    g_bPurchaseSystemActive[client] = false;
 }
 
 /**
@@ -3418,6 +3762,7 @@ void ResetClientData(int client)
     g_bRecMoneySet[client] = false;
     g_iRecStartMoney[client] = 0;
     g_fRecStartTime[client] = 0.0;
+    g_bPurchaseSystemActive[client] = false;
 
     BotShared_ResetBotState(client);    
 }
@@ -3479,9 +3824,12 @@ public int Sort_BotsByMoney(int index1, int index2, Handle array, Handle hndl)
 // 为指定demo加载购买数据
 JSONObject LoadPurchaseDataForDemo(const char[] szMap, const char[] szDemoFolder)
 {
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szPath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szPath, sizeof(szPath), 
-        "data/botmimic/all/%s/%s/purchases.json", szMap, szDemoFolder);
+        "data/botmimic/%s/%s/%s/purchases.json", szModeBase, szMap, szDemoFolder);
     
     if (!FileExists(szPath))
         return null;
@@ -3498,7 +3846,7 @@ public Action Command_SelectDemo(int client, int args)
         GetMapDisplayName(szMap, szMap, sizeof(szMap));
         
         char szMapBasePath[PLATFORM_MAX_PATH];
-        BuildPath(Path_SM, szMapBasePath, sizeof(szMapBasePath), "data/botmimic/all/%s", szMap);
+        BuildPath(Path_SM, szMapBasePath, sizeof(szMapBasePath), "data/botmimic/%s/%s", szMap);
         
         ReplyToCommand(client, "[Bot REC] Usage: sm_botrec_select <folder_name>");
         ReplyToCommand(client, "[Bot REC] Available demos:");
@@ -3542,8 +3890,11 @@ public Action Command_SelectDemo(int client, int args)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szDemoPath[PLATFORM_MAX_PATH];
-    BuildPath(Path_SM, szDemoPath, sizeof(szDemoPath), "data/botmimic/all/%s/%s", szMap, szDemoFolder);
+    BuildPath(Path_SM, szDemoPath, sizeof(szDemoPath), "data/botmimic/%s/%s/%s", szModeBase, szMap, szDemoFolder);
     
     if (!DirExists(szDemoPath))
     {
@@ -3631,10 +3982,13 @@ ArrayList GetRecFilesForRound(const char[] szMap, const char[] szDemoFolder,
 {
     ArrayList hRecFiles = new ArrayList(PLATFORM_MAX_PATH);
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szRoundPath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szRoundPath, sizeof(szRoundPath), 
-        "data/botmimic/all/%s/%s/round%d/%s", 
-        szMap, szDemoFolder, iRound + 1, szTeamName);
+        "data/botmimic/%s/%s/%s/round%d/%s", 
+        szModeBase, szMap, szDemoFolder, iRound + 1, szTeamName);
     
     if (!DirExists(szRoundPath))
         return hRecFiles;
@@ -3758,6 +4112,11 @@ ArrayList BuildRecEquipmentInfo(ArrayList hRecFiles, JSONObject jTeam, int iTeam
  */
 void ScheduleDynamicPause(int iRound)
 {
+    if (g_iPlaybackMode == Playback_PreGame)
+    {
+        return;
+    }
+    
     if (IsInWarmup())
     {
         return;
@@ -4069,8 +4428,11 @@ public Action Command_DebugInfo(int client, int args)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szMapPath[PLATFORM_MAX_PATH];
-    BuildPath(Path_SM, szMapPath, sizeof(szMapPath), "data/botmimic/all/%s", szMap);
+    BuildPath(Path_SM, szMapPath, sizeof(szMapPath), "data/botmimic/%s/%s", szModeBase, szMap);
     
     ReplyToCommand(client, "[Bot REC] ===== DEBUG INFO =====");
     ReplyToCommand(client, "Map: %s", szMap);
@@ -4264,9 +4626,12 @@ bool LoadC4HolderDataFile(const char[] szRecFolder)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szPath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szPath, sizeof(szPath), 
-        "data/botmimic/all/%s/%s/c4_holders.json", szMap, szRecFolder);
+        "data/botmimic/%s/%s/%s/c4_holders.json", szModeBase, szMap, szRecFolder);
     
     if (!FileExists(szPath))
     {
@@ -4552,9 +4917,12 @@ bool LoadSpawnDataFile(const char[] szRecFolder)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szPath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szPath, sizeof(szPath), 
-        "data/botmimic/all/%s/%s/spawns.json", szMap, szRecFolder);
+        "data/botmimic/%s/%s/%s/spawns.json", szModeBase, szMap, szRecFolder);
     
     if (!FileExists(szPath))
     {
@@ -4735,6 +5103,11 @@ void PreAssignPlayerSpawns()
         delete jRounds;
     }
     
+    // 用一个临时列表记录本次已分配的出生点
+    ArrayList hThisRoundAssigned[4];
+    for (int i = 0; i < 4; i++)
+        hThisRoundAssigned[i] = new ArrayList(3);
+    
     // 为每个真实玩家分配出生点
     for (int client = 1; client <= MaxClients; client++)
     {
@@ -4769,6 +5142,23 @@ void PreAssignPlayerSpawns()
                 }
             }
             
+            // 检查是否已被其他玩家分配
+            if (!isUsed)
+            {
+                for (int j = 0; j < hThisRoundAssigned[iTeam].Length; j++)
+                {
+                    float assignedPos[3];
+                    hThisRoundAssigned[iTeam].GetArray(j, assignedPos, 3);
+                    
+                    float dist = GetVectorDistance(spawnPos, assignedPos);
+                    if (dist < 10.0)
+                    {
+                        isUsed = true;
+                        break;
+                    }
+                }
+            }
+            
             // 找到未使用的出生点
             if (!isUsed)
             {
@@ -4777,6 +5167,9 @@ void PreAssignPlayerSpawns()
                 g_fAssignedSpawnPos[client][2] = spawnPos[2];
                 g_bHasAssignedSpawn[client] = true;
                 foundSpawn = true;
+                
+                // 记录已分配
+                hThisRoundAssigned[iTeam].PushArray(spawnPos, 3);
                 break;
             }
         }
@@ -4790,7 +5183,10 @@ void PreAssignPlayerSpawns()
     
     // 清理
     for (int i = 0; i < 4; i++)
+    {
         delete hUsedSpawns[i];
+        delete hThisRoundAssigned[i]; 
+    }
 }
 
 /**
@@ -4866,9 +5262,12 @@ bool LoadMoneyDataFile(const char[] szRecFolder)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szPath[PLATFORM_MAX_PATH];
     BuildPath(Path_SM, szPath, sizeof(szPath), 
-        "data/botmimic/all/%s/%s/money.json", szMap, szRecFolder);
+        "data/botmimic/%s/%s/%s/money.json", szModeBase, szMap, szRecFolder);
     
     if (!FileExists(szPath))
     {
@@ -4896,9 +5295,12 @@ bool LoadVoiceDataFile(const char[] szRecFolder)
     GetCurrentMap(szMap, sizeof(szMap));
     GetMapDisplayName(szMap, szMap, sizeof(szMap));
     
+    char szModeBase[16];
+    GetModeBasePath(szModeBase, sizeof(szModeBase));
+    
     char szPath[PLATFORM_MAX_PATH];
     Format(szPath, sizeof(szPath), 
-        "sound/botrec/%s/%s/voice_info.json", szMap, szRecFolder);
+        "sound/botrec/%s/%s/%s/voice_info.json", szModeBase, szMap, szRecFolder);
 
     if (!FileExists(szPath))
     {
@@ -4936,7 +5338,7 @@ bool LoadVoiceDataFile(const char[] szRecFolder)
             
             for(int t=0; t<2; t++) {
                 char szVoicePath[PLATFORM_MAX_PATH];
-                Format(szVoicePath, sizeof(szVoicePath), "botrec/%s/%s/round%d/%s/%s", szMap, szRecFolder, iRecordRound, szTeams[t], szVoiceFile);
+                Format(szVoicePath, sizeof(szVoicePath), "botrec/%s/%s/%s/round%d/%s/%s", szModeBase, szMap, szRecFolder, iRecordRound, szTeams[t], szVoiceFile);
                 
                 char szFullPath[PLATFORM_MAX_PATH];
                 Format(szFullPath, sizeof(szFullPath), "sound/%s", szVoicePath);
@@ -5022,9 +5424,12 @@ bool LoadVoiceActionsForBot(int client, int iRound)
             char szUseDemoFolder[PLATFORM_MAX_PATH];
             GetUseDemoFolder(client, szUseDemoFolder, sizeof(szUseDemoFolder));
             
+            char szModeBase[16];
+            GetModeBasePath(szModeBase, sizeof(szModeBase));
+            
             char szVoicePath[PLATFORM_MAX_PATH];
-            Format(szVoicePath, sizeof(szVoicePath), "botrec/%s/%s/round%d/%s/%s", 
-                szMap, szUseDemoFolder, iTargetRound, szTeamFolder, szVoiceFile);
+            Format(szVoicePath, sizeof(szVoicePath), "botrec/%s/%s/%s/round%d/%s/%s", 
+                szModeBase, szMap, szUseDemoFolder, iTargetRound, szTeamFolder, szVoiceFile);
             
             entry.fileIndex = g_hVoiceFiles[client].PushString(szVoicePath);
             g_hVoiceActions[client].PushArray(entry, sizeof(VoiceActionEntry));
@@ -5055,7 +5460,16 @@ public Action Timer_ExecuteVoiceAction(Handle hTimer, DataPack pack)
         return Plugin_Stop;
     }
     
-    if (IsInWarmup() || g_hVoiceActions[client] == null)
+    // 热身期间停止语音timer
+    if (IsInWarmup())
+    {
+        g_hVoiceTimer[client] = null;
+        delete pack;
+        return Plugin_Stop;
+    }
+    
+    // 只要语音数据存在就继续
+    if (g_hVoiceActions[client] == null)
     {
         g_hVoiceTimer[client] = null;
         delete pack;
@@ -5099,4 +5513,132 @@ public Action Timer_ExecuteVoiceAction(Handle hTimer, DataPack pack)
     }
     
     return Plugin_Continue;
+}
+
+/**
+ * 根据当前模式获取基础路径文件夹名
+ */
+void GetModeBasePath(char[] szOutput, int iMaxLen)
+{
+    if (g_iPlaybackMode == Playback_PreGame)
+        strcopy(szOutput, iMaxLen, "pregame");
+    else
+        strcopy(szOutput, iMaxLen, "full");
+}
+
+void StartBotRecPlayback(int client)
+{
+    g_bPlayingRoundStartRec[client] = true;
+    float fGameTime = GetGameTime();
+    g_fRecStartTime[client] = fGameTime;
+    
+    BotMimic_PlayRecordFromFile(client, g_szRoundStartRecPath[client]);
+    SDKHook(client, SDKHook_OnTakeDamage, OnTakeDamage);
+    BotShared_SetBotState(client, BotState_PlayingREC);
+}
+
+public Action Command_SetPlaybackMode(int client, int args)
+{
+    if (args < 1)
+    {
+        ReplyToCommand(client, "[Bot REC] Usage: sm_botrec_playback <mode>");
+        ReplyToCommand(client, "  0 = Full Round (from round start)");
+        ReplyToCommand(client, "  1 = PreGame (1s before freeze ends)");
+        return Plugin_Handled;
+    }
+    
+    char szArg[8];
+    GetCmdArg(1, szArg, sizeof(szArg));
+    int iMode = StringToInt(szArg);
+    
+    if (iMode < 0 || iMode > 1)
+    {
+        ReplyToCommand(client, "[Bot REC] Invalid mode! Use 0 or 1");
+        return Plugin_Handled;
+    }
+    
+    g_cvPlaybackMode.IntValue = iMode;
+    g_iPlaybackMode = view_as<PlaybackMode>(iMode);
+    
+    char szModeName[64];
+    switch (g_iPlaybackMode)
+    {
+        case Playback_Full: strcopy(szModeName, sizeof(szModeName), "Full Round");
+        case Playback_PreGame: strcopy(szModeName, sizeof(szModeName), "PreGame");
+    }
+    
+    ReplyToCommand(client, "[Bot REC] Playback mode set to: %s", szModeName);
+    ReplyToCommand(client, "[Bot REC] Use 'mp_restartgame 1' to apply changes");
+    return Plugin_Handled;
+}
+
+/**
+ * 获取距离回合开始的时间
+ */
+float GetRoundStartTime()
+{
+    return g_fRoundStartGameTime;
+}
+
+/**
+ * PreGame：在冻结时间前1秒播放
+ */
+public Action Timer_StartAllBotsPlayback(Handle hTimer)
+{
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
+            continue;
+        
+        if (g_szRoundStartRecPath[i][0] == '\0')
+            continue;
+        
+        // 开始正式播放
+        StartBotRecPlayback(i);
+    }
+    
+    return Plugin_Stop;
+}
+
+/**
+ * PreGame：瞬间播放rec然后停止（定位）
+ */
+public Action Timer_InstantPlayForPosition(Handle hTimer)
+{
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
+            continue;
+        
+        if (g_szRoundStartRecPath[i][0] == '\0')
+            continue;
+        
+        // 开始播放rec
+        BotMimic_PlayRecordFromFile(i, g_szRoundStartRecPath[i]);
+        
+        // 0.1秒后停止
+        DataPack pack = new DataPack();
+        pack.WriteCell(GetClientUserId(i));
+        CreateTimer(1.0, Timer_StopInstantPlay, pack, TIMER_FLAG_NO_MAPCHANGE);
+    }
+    
+    return Plugin_Stop;
+}
+
+/**
+ * 停止瞬间播放（定位）
+ */
+public Action Timer_StopInstantPlay(Handle hTimer, DataPack pack)
+{
+    pack.Reset();
+    int iUserId = pack.ReadCell();
+    delete pack;
+    
+    int client = GetClientOfUserId(iUserId);
+    if (!IsValidClient(client) || !BotMimic_IsPlayerMimicing(client))
+        return Plugin_Stop;
+
+    BotMimic_StopPlayerMimic(client);
+    
+    return Plugin_Stop;
 }
