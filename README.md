@@ -1,5 +1,8 @@
 **CS2 version of these plugins is currently on hold waiting to see if Source2Mod releases**
 
+Meanwhile take a look at this excellent plugin made for CS2 using CounterStrikeSharp by ed0ard
+
+https://github.com/ed0ard/CS2-Bot-Improver
 
 # Edited Plugins
 

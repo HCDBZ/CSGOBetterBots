@@ -136,6 +136,24 @@
 				"library"	"server"
 				"windows"	"\x55\x8B\xEC\x83\xE4\xF8\x81\xEC\x4C\x01\x00\x00\x53\x56\x57\x8B\xF9\x8B\x07"
 			}
+			"CCSBot::OnAudibleEvent"
+			{
+				// Has 'Heard noise' string
+				"library"	"server"
+				"windows"	"\x55\x8B\xEC\x83\xE4\xF0\x83\xEC\x58\x56\x57\x8B\xF9\xF3\x0F\x11\x5C\x24\x24"
+			}
+			"CCSBot::TryToRetreat"
+			{
+				// Is inside CCSBot state machine, has 'Retreating to a safe spot!\n' string
+				"library"	"server"
+				"windows"	"\x55\x8B\xEC\x83\xEC\x14\x83\x3D\x2A\x2A\x2A\x2A\x00"
+			}
+			"CCSBot::CanSeeLooseBomb"
+			{
+				// Is near CCSBot::CanSeePlantedBomb
+				"library"	"server"
+				"windows"	"\x51\x56\x57\x8B\xF9\x8B\x0D\x2A\x2A\x2A\x2A\x83\xB9\x64\x18\x00\x00\x01"
+			}
 		}
 		"Offsets"
 		{
@@ -291,6 +309,52 @@
 					}
 				}
 			}
+			"CCSBot::OnAudibleEvent"
+			{
+				"signature" "CCSBot::OnAudibleEvent"
+				"callconv" "thiscall"
+				"return" "void"
+				"this" "entity"
+				"arguments"
+				{
+					"event"
+					{
+						"type" "int"
+					}
+					"player"
+					{
+						"type" "cbaseentity"
+					}
+					"range"
+					{
+						"type" "float"
+						"register" "xmm3"
+					}
+					"priority"
+					{
+						"type" "int"
+					}
+					"isHostile"
+					{
+						"type" "bool"
+					}
+					"isFootstep"
+					{
+						"type" "bool"
+					}
+					"actualOrigin"
+					{
+						"type" "int"
+					}
+				}
+			}
+			"CCSBot::CanSeeLooseBomb"
+			{
+				"signature" "CCSBot::CanSeeLooseBomb"
+				"callconv" "thiscall"
+				"return" "bool"
+				"this" "entity"
+			}
 		}
 		"MemPatches"
 		{
@@ -334,14 +398,14 @@
 					"patch"		"\x90\x90\x90\x90\x90\x90\x90\x90"
 				}
 			}
-			"CCSBot::Blind::DontWait"
+			"CCSBot::Blind::SkipWait"
 			{
 				"signature" "CCSBot::Blind"
 				"windows"
 				{
-					"offset"	"73h"
-					"verify"	"\xF3\x0F\x10\x48\x10"
-					"patch"		"\x90\x90\x90\x90\x90"
+					"offset"	"62h"
+					"verify"	"\x8D\xBE\x38\x57\x00\x00"
+					"patch"		"\xE9\x8B\x00\x00\x00\x90"
 				}
 			}
 			"CCSBot::FindMostDangerousThreat::AlwaysNotice"

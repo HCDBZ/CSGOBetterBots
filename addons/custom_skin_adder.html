@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CS:GO Custom Skin Adder</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; }
+    select option { background: #1e2a3a; color: #ddd; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script type="text/babel">
+    const { useState, useCallback, useMemo, useRef } = React;
+
+const RARITIES = [
+  { id: "common",    value: 1, label: "Consumer Grade",   internalName: "Common",    color: "#b0c3d9" },
+  { id: "uncommon",  value: 2, label: "Industrial Grade", internalName: "Uncommon",  color: "#5e98d9" },
+  { id: "rare",      value: 3, label: "Mil-Spec",         internalName: "Rare",      color: "#4b69ff" },
+  { id: "mythical",  value: 4, label: "Restricted",       internalName: "Mythical",  color: "#8847ff" },
+  { id: "legendary", value: 5, label: "Classified",       internalName: "Legendary", color: "#d32ce6" },
+  { id: "ancient",   value: 6, label: "Covert",           internalName: "Ancient",   color: "#eb4b4b" },
+  { id: "immortal",  value: 7, label: "Contraband",       internalName: "Immortal",  color: "#e4ae39" },
+];
+
+const TEMPLATE_PROPS = [
+  "style","pattern","use_normal","normal",
+  "color0","color1","color2","color3",
+  "pattern_scale","phongexponent","phongintensity",
+  "phongalbedoboost","view_model_exponent_override_size",
+  "ignore_weapon_size_scale","only_first_material",
+  "pattern_offset_x_start","pattern_offset_x_end",
+  "pattern_offset_y_start","pattern_offset_y_end",
+  "pattern_rotate_start","pattern_rotate_end",
+  "wear_remap_min","wear_remap_max","pearlescent",
+];
+
+const DEFAULT_TEMPLATE = {
+  style:"7",pattern_scale:"1.000000",phongexponent:"255",phongintensity:"25",
+  ignore_weapon_size_scale:"1",only_first_material:"0",
+  pattern_offset_x_start:"0.000000",pattern_offset_x_end:"0.000000",
+  pattern_offset_y_start:"0.000000",pattern_offset_y_end:"0.000000",
+  pattern_rotate_start:"0.000000",pattern_rotate_end:"0.000000",
+  wear_remap_min:"0.000000",wear_remap_max:"1.000000",
+};
+
+const GLOVE_CLASSES = [
+  "studded_bloodhound_gloves","studded_brokenfang_gloves","leather_handwraps",
+  "slick_gloves","sporty_gloves","studded_hydra_gloves","motorcycle_gloves","specialist_gloves"
+];
+
+function isGloveClass(className) {
+  return GLOVE_CLASSES.includes(className);
+}
+
+function parseAllPaintKits(text) {
+  const lines = text.split("\n");
+  const kits = {};
+  let i = 0;
+  while (i < lines.length) {
+    const s = lines[i].trim().replace(/\r/, "");
+    if (s === '"paint_kits"') {
+      let depth = 0, curId = null;
+      i++;
+      while (i < lines.length) {
+        const s2 = lines[i].trim().replace(/\r/, "");
+        if (s2 === "{") { depth++; }
+        else if (s2 === "}") {
+          depth--;
+          if (depth === 0) break;
+          curId = null;
+        } else if (depth === 1) {
+          const m = s2.match(/^"(\d+)"$/);
+          if (m) { curId = parseInt(m[1]); kits[curId] = {}; }
+        } else if (depth === 2 && curId !== null) {
+          const kv = s2.match(/^"(.+?)"\s+"(.+?)"$/);
+          if (kv) kits[curId][kv[1]] = kv[2];
+        }
+        i++;
+      }
+    }
+    i++;
+  }
+  return kits;
+}
+
+function parseLastPaintKitsOnly(text) {
+  const lines = text.split("\n");
+  let lastPKStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim().replace(/\r/, "") === '"paint_kits"') lastPKStart = i;
+  }
+  if (lastPKStart === -1) return {};
+  const kits = {};
+  let depth = 0, curId = null;
+  for (let i = lastPKStart + 1; i < lines.length; i++) {
+    const s = lines[i].trim().replace(/\r/, "");
+    if (s === "{") { depth++; }
+    else if (s === "}") {
+      depth--;
+      if (depth === 0) break;
+      curId = null;
+    } else if (depth === 1) {
+      const m = s.match(/^"(\d+)"$/);
+      if (m) { curId = parseInt(m[1]); kits[curId] = {}; }
+    } else if (depth === 2 && curId !== null) {
+      const kv = s.match(/^"(.+?)"\s+"(.+?)"$/);
+      if (kv) kits[curId][kv[1]] = kv[2];
+    }
+  }
+  return kits;
+}
+
+function findLastSectionEnd(lines, sectionName) {
+  let lastStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim().replace(/\r/, "") === `"${sectionName}"`) lastStart = i;
+  }
+  if (lastStart === -1) return -1;
+  let depth = 0;
+  for (let i = lastStart + 1; i < lines.length; i++) {
+    const s = lines[i].trim().replace(/\r/, "");
+    if (s === "{") depth++;
+    else if (s === "}") { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+function buildPaintKitBlock(id, name, pattern, normalPath, templateProps) {
+  const props = { ...templateProps };
+  props.name = name;
+  props.description_string = `#PaintKit_${name}`;
+  props.description_tag = `#PaintKit_${name}_Tag`;
+  if (pattern) props.pattern = pattern;
+  if (normalPath) props.normal = normalPath;
+  let out = [`\t\t"${id}"`, `\t\t{`];
+  const first = ["name", "description_string", "description_tag"];
+  first.forEach(k => { if (props[k]) out.push(`\t\t\t"${k}"\t\t"${props[k]}"`); });
+  TEMPLATE_PROPS.forEach(k => {
+    if (props[k] && !first.includes(k)) out.push(`\t\t\t"${k}"\t\t"${props[k]}"`);
+  });
+  out.push(`\t\t}`);
+  return out.join("\r\n");
+}
+
+function App() {
+  const [files, setFiles] = useState({ itemsGame: null, csgoEnglish: null, itemsEn: null });
+  const [fileContents, setFileContents] = useState({ itemsGame: "", csgoEnglish: null, itemsEn: null });
+  const [parsedData, setParsedData] = useState({ weapons: [], paintKits: {}, templates: [] });
+  const [skins, setSkins] = useState([]);
+  const [form, setForm] = useState({
+    name: "", displayName: "", weapon: "", rarity: "rare", template: "", pattern: "", wearMin: "0.000000", wearMax: "1.000000"
+  });
+  const [processing, setProcessing] = useState(false);
+  const [log, setLog] = useState([]);
+  const [step, setStep] = useState(0);
+  const [templateSearch, setTemplateSearch] = useState("");
+  const [showTemplateDropdown, setShowTemplateDropdown] = useState(false);
+  const templateRef = useRef(null);
+
+  const handleFile = useCallback((key, file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    if (key === "csgoEnglish") {
+      reader.onload = (e) => {
+        setFiles(p => ({ ...p, [key]: file }));
+        setFileContents(p => ({ ...p, [key]: new Uint8Array(e.target.result) }));
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      reader.onload = (e) => {
+        setFiles(p => ({ ...p, [key]: file }));
+        setFileContents(p => ({ ...p, [key]: e.target.result }));
+      };
+      reader.readAsText(file);
+    }
+  }, []);
+
+  const allFilesLoaded = files.itemsGame && files.csgoEnglish && files.itemsEn;
+
+  const parseFiles = useCallback(() => {
+    if (!allFilesLoaded) return;
+    try {
+      const itemsEn = JSON.parse(fileContents.itemsEn);
+
+      // Weapons
+      const weapons = itemsEn.weapons
+        .filter(w => w.paints && Object.keys(w.paints).length > 0)
+        .map(w => ({ className: w.class_name, displayName: w.item_name, isGlove: false }))
+        .sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+      // Gloves
+      const gloves = (itemsEn.gloves || [])
+        .filter(g => g.paints && Object.keys(g.paints).length > 0)
+        .map(g => ({ className: g.class_name, displayName: g.item_name, isGlove: true }))
+        .sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+      const allItems = [...weapons, ...gloves];
+
+      const paintKits = parseAllPaintKits(fileContents.itemsGame);
+      const templates = Object.entries(paintKits)
+        .filter(([, v]) => v.name && !v.name.startsWith("placeholder"))
+        .map(([id, v]) => ({ id: parseInt(id), name: v.name, hasNormal: v.use_normal === "1" }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      setParsedData({ weapons: allItems, paintKits, templates, itemsEnData: itemsEn });
+      setStep(1);
+    } catch (err) {
+      alert("Error parsing files: " + err.message);
+    }
+  }, [allFilesLoaded, fileContents]);
+
+  const filteredTemplates = useMemo(() => {
+    const q = (templateSearch || "").toLowerCase();
+    if (!q) return parsedData.templates.slice(0, 50);
+    return parsedData.templates.filter(t =>
+      t.name.toLowerCase().includes(q) || String(t.id).includes(q)
+    ).slice(0, 50);
+  }, [templateSearch, parsedData.templates]);
+
+  // Get selected template info for normal map warning
+  const selectedTemplateInfo = useMemo(() => {
+    if (!form.template) return null;
+    const t = parsedData.templates.find(t => t.name === form.template);
+    if (!t) return null;
+    const kit = parsedData.paintKits[t.id];
+    return { ...t, normal: kit?.normal, use_normal: kit?.use_normal };
+  }, [form.template, parsedData]);
+
+  const selectedWeaponIsGlove = useMemo(() => {
+    const w = parsedData.weapons.find(w => w.className === form.weapon);
+    return w?.isGlove || false;
+  }, [form.weapon, parsedData.weapons]);
+
+  const addSkin = useCallback(() => {
+    if (!form.name || !form.displayName || !form.weapon) {
+      alert("Name, Display Name, and Weapon are required.");
+      return;
+    }
+    if (skins.some(s => s.name === form.name)) {
+      alert("A skin with this name is already in the queue.");
+      return;
+    }
+    const w = parsedData.weapons.find(w => w.className === form.weapon);
+    setSkins(p => [...p, { ...form, isGlove: w?.isGlove || false }]);
+    setForm(p => ({ ...p, name: "", displayName: "", pattern: "", template: p.template }));
+    setTemplateSearch("");
+  }, [form, skins, parsedData.weapons]);
+
+  const removeSkin = useCallback((idx) => {
+    setSkins(p => p.filter((_, i) => i !== idx));
+  }, []);
+
+  const processAndDownload = useCallback(() => {
+    if (skins.length === 0) return;
+    setProcessing(true);
+    const logs = [];
+
+    try {
+      let igLines = fileContents.itemsGame.split("\n");
+      const kits = parsedData.paintKits;
+
+      // Find highest IDs separately for weapon skins (1300-11999) and glove skins (12000+)
+      const lastSectionKits = parseLastPaintKitsOnly(fileContents.itemsGame);
+      let highestWeaponId = 1299;
+      let highestGloveId = 11999;
+      Object.keys(lastSectionKits).forEach(id => {
+        const n = parseInt(id);
+        if (n >= 1300 && n < 12000) highestWeaponId = Math.max(highestWeaponId, n);
+        if (n >= 12000) highestGloveId = Math.max(highestGloveId, n);
+      });
+      let nextWeaponId = highestWeaponId + 1;
+      let nextGloveId = highestGloveId + 1;
+      logs.push(`Weapon skin IDs: next = ${nextWeaponId} (highest: ${highestWeaponId})`);
+      logs.push(`Glove skin IDs: next = ${nextGloveId} (highest: ${highestGloveId})`);
+
+      const itemsEn = JSON.parse(fileContents.itemsEn);
+
+      // Decode csgo_english.txt (UTF-16 LE)
+      const decoder = new TextDecoder("utf-16le");
+      let csgoText = decoder.decode(fileContents.csgoEnglish);
+      if (csgoText.charCodeAt(0) === 0xFEFF) csgoText = csgoText.slice(1);
+      let csgoLines = csgoText.split("\r\n");
+
+      // Find insertion point: after the last PaintKit_*_Tag line before the first // comment
+      let csgoInsertIdx = -1;
+      let tokensStart = -1;
+      for (let i = 0; i < csgoLines.length; i++) {
+        if (csgoLines[i].trim() === "{" && i > 0 && csgoLines[i - 1].trim().replace(/"/g, "") === "Tokens") {
+          tokensStart = i + 1;
+          break;
+        }
+      }
+      if (tokensStart !== -1) {
+        for (let i = tokensStart; i < csgoLines.length; i++) {
+          const trimmed = csgoLines[i].trim();
+          if (trimmed.startsWith("//")) break;
+          if (trimmed.includes("PaintKit_") && trimmed.includes("_Tag")) {
+            csgoInsertIdx = i + 1;
+          }
+        }
+      }
+
+      skins.forEach(skin => {
+        const isGlove = skin.isGlove;
+        const kitId = isGlove ? nextGloveId++ : nextWeaponId++;
+        logs.push(`\n--- ${skin.name} (${skin.displayName}) → ID ${kitId}${isGlove ? " [glove]" : ""} ---`);
+
+        let tProps = { ...DEFAULT_TEMPLATE };
+        if (skin.template) {
+          const tEntry = Object.entries(kits).find(([, v]) => v.name === skin.template);
+          if (tEntry) {
+            TEMPLATE_PROPS.forEach(k => { if (tEntry[1][k]) tProps[k] = tEntry[1][k]; });
+            logs.push(`  Template: ${skin.template} (ID ${tEntry[0]})`);
+          } else {
+            logs.push(`  WARNING: Template '${skin.template}' not found, using defaults`);
+          }
+        }
+
+        if (skin.wearMin !== "0.000000") tProps.wear_remap_min = skin.wearMin;
+        if (skin.wearMax !== "1.000000") tProps.wear_remap_max = skin.wearMax;
+
+        const pattern = skin.pattern || skin.name.replace(/^(cu|gs|sp|am|hy)_/, "");
+
+        // If template uses normal maps, derive normal path from pattern
+        let normalPath = null;
+        if (tProps.use_normal === "1") {
+          normalPath = pattern + "_normal";
+          logs.push(`  Normal map: ${normalPath} (template uses normals)`);
+        }
+
+        // 1. Insert paint_kit block
+        const block = buildPaintKitBlock(kitId, skin.name, pattern, normalPath, tProps);
+        const pkEnd = findLastSectionEnd(igLines, "paint_kits");
+        if (pkEnd !== -1) {
+          igLines.splice(pkEnd, 0, block);
+          logs.push(`  [items_game] paint_kit block inserted`);
+        } else {
+          logs.push(`  ERROR: paint_kits section not found`);
+        }
+
+        // 2. Insert paint_kits_rarity
+        const pkrEnd = findLastSectionEnd(igLines, "paint_kits_rarity");
+        if (pkrEnd !== -1) {
+          const tabs = "\t".repeat(Math.max(1, 6 - Math.floor(skin.name.length / 4)));
+          igLines.splice(pkrEnd, 0, `\t\t"${skin.name}"${tabs}"${skin.rarity}"\r`);
+          logs.push(`  [items_game] rarity: ${skin.rarity}`);
+        }
+
+        // 3. Add to csgo_english.txt (after last custom PaintKit entry)
+        const tagKey = `PaintKit_${skin.name}_Tag`;
+        if (!csgoText.includes(tagKey)) {
+          if (csgoInsertIdx !== -1) {
+            csgoLines.splice(csgoInsertIdx, 0, `\t\t"${tagKey}"\t\t\t\t\t\t\t\t\t\t\t"${skin.displayName}"`);
+            csgoInsertIdx++;
+            logs.push(`  [csgo_english] Added "${tagKey}"`);
+          }
+        } else {
+          logs.push(`  [csgo_english] Already exists, skipped`);
+        }
+
+        // 4a. Add to items_en.json paints array
+        const rarityInfo = RARITIES.find(r => r.id === skin.rarity);
+        itemsEn.paints.push({
+          def_index: kitId,
+          name: skin.name,
+          rarity: { id: rarityInfo?.value || 3, name: rarityInfo?.internalName || "Rare" },
+          wear_remap: { min: tProps.wear_remap_min || "0.000000", max: tProps.wear_remap_max || "1.000000" },
+          item_name: skin.displayName,
+        });
+        logs.push(`  [items_en] Added to paints array`);
+
+        // 4b. Add to weapon/glove paints object
+        const collection = isGlove ? itemsEn.gloves : itemsEn.weapons;
+        const item = collection?.find(w => w.class_name === skin.weapon);
+        if (item && item.paints) {
+          const existingKeys = Object.keys(item.paints).map(Number);
+          const nextKey = existingKeys.length > 0 ? Math.max(...existingKeys) + 1 : 0;
+          item.paints[String(nextKey)] = kitId;
+          logs.push(`  [items_en] Added to ${skin.weapon} paints["${nextKey}"] = ${kitId}`);
+        } else {
+          logs.push(`  WARNING: ${skin.weapon} not found in items_en.json`);
+        }
+      });
+
+      // Build output files
+      const igOutput = igLines.join("\n");
+      const enOutput = JSON.stringify(itemsEn, null, 2);
+      const csgoRejoined = csgoLines.join("\r\n");
+
+      const csgoUtf16 = new Uint8Array(2 + csgoRejoined.length * 2);
+      csgoUtf16[0] = 0xFF; csgoUtf16[1] = 0xFE;
+      for (let i = 0; i < csgoRejoined.length; i++) {
+        const code = csgoRejoined.charCodeAt(i);
+        csgoUtf16[2 + i * 2] = code & 0xFF;
+        csgoUtf16[2 + i * 2 + 1] = (code >> 8) & 0xFF;
+      }
+
+      const dl = (data, name) => {
+        const blob = data instanceof Uint8Array
+          ? new Blob([data], { type: "application/octet-stream" })
+          : new Blob([data], { type: "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a"); a.href = url; a.download = name; a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      setTimeout(() => dl(igOutput, "items_game.txt"), 100);
+      setTimeout(() => dl(enOutput, "items_en.json"), 400);
+      setTimeout(() => dl(csgoUtf16, "csgo_english.txt"), 700);
+
+      logs.push(`\n✓ All ${skins.length} skin(s) processed. Files downloading...`);
+      logs.push(`\nReminder: Place texture files in the appropriate directory.`);
+      setLog(logs);
+      setStep(2);
+    } catch (err) {
+      logs.push(`\nERROR: ${err.message}`);
+      setLog(logs);
+    }
+    setProcessing(false);
+  }, [skins, fileContents, parsedData]);
+
+  const rarityColor = RARITIES.find(r => r.id === form.rarity)?.color || "#4b69ff";
+  const derivedPattern = form.pattern || (form.name ? form.name.replace(/^(cu|gs|sp|am|hy)_/, "") : "");
+
+  return (
+    <div style={{
+      minHeight: "100vh", fontFamily: "'Segoe UI', Tahoma, sans-serif",
+      background: "linear-gradient(145deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%)",
+      color: "#e0e0e0", padding: "24px",
+    }}>
+      <div style={{ maxWidth: 820, margin: "0 auto" }}>
+        <div style={{ textAlign: "center", marginBottom: 32 }}>
+          <h1 style={{
+            fontSize: 28, fontWeight: 700, margin: 0, letterSpacing: 2,
+            background: "linear-gradient(90deg, #e4ae39, #eb4b4b, #d32ce6, #8847ff, #4b69ff)",
+            WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+          }}>CUSTOM SKIN ADDER</h1>
+          <p style={{ color: "#888", fontSize: 13, marginTop: 4 }}>
+            Automate items_game.txt · csgo_english.txt · items_en.json
+          </p>
+        </div>
+
+        {step === 0 && (
+          <div style={cardStyle}>
+            <h2 style={headingStyle}>1. Load Files</h2>
+            {[
+              { key: "itemsGame", label: "items_game.txt" },
+              { key: "csgoEnglish", label: "csgo_english.txt" },
+              { key: "itemsEn", label: "items_en.json" },
+            ].map(({ key, label }) => {
+              const loaded = !!files[key];
+              return (
+                <div key={key} style={{
+                  display: "flex", alignItems: "center", gap: 12, marginBottom: 12,
+                  padding: "10px 14px", borderRadius: 8,
+                  background: loaded ? "rgba(76,175,80,0.1)" : "rgba(255,255,255,0.03)",
+                  border: `1px solid ${loaded ? "rgba(76,175,80,0.3)" : "rgba(255,255,255,0.06)"}`,
+                }}>
+                  <span style={{ fontSize: 18 }}>{loaded ? "✓" : "○"}</span>
+                  <span style={{ flex: 1, fontSize: 14, color: loaded ? "#81c784" : "#999" }}>{label}</span>
+                  <label style={fileBtnStyle}>
+                    {loaded ? "Replace" : "Choose File"}
+                    <input type="file" accept={key === "itemsEn" ? ".json" : ".txt"} style={{ display: "none" }}
+                      onChange={e => handleFile(key, e.target.files[0])} />
+                  </label>
+                </div>
+              );
+            })}
+            <button disabled={!allFilesLoaded} onClick={parseFiles} style={{
+              ...primaryBtnStyle,
+              background: allFilesLoaded ? "linear-gradient(135deg, #e4ae39, #eb4b4b)" : "rgba(255,255,255,0.06)",
+              color: allFilesLoaded ? "#fff" : "#666", cursor: allFilesLoaded ? "pointer" : "default",
+            }}>
+              {allFilesLoaded ? "PARSE & CONTINUE →" : "Upload all 3 files to continue"}
+            </button>
+            {allFilesLoaded && (
+              <p style={{ textAlign: "center", color: "#666", fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+                This may take a few seconds for large files
+              </p>
+            )}
+          </div>
+        )}
+
+        {step === 1 && (
+          <>
+            <div style={cardStyle}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+                <h2 style={{ ...headingStyle, margin: 0 }}>2. Add Skin</h2>
+                <span style={{ fontSize: 11, color: "#555" }}>
+                  {parsedData.templates.length} templates available
+                </span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div>
+                  <label style={labelStyle}>Internal Name</label>
+                  <input style={inputStyle} placeholder="cu_ak47_myskin" value={form.name}
+                    onChange={e => setForm(p => ({ ...p, name: e.target.value }))} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Display Name</label>
+                  <input style={inputStyle} placeholder="My Cool Skin" value={form.displayName}
+                    onChange={e => setForm(p => ({ ...p, displayName: e.target.value }))} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Weapon / Glove</label>
+                  <select style={inputStyle} value={form.weapon}
+                    onChange={e => setForm(p => ({ ...p, weapon: e.target.value }))}>
+                    <option value="">Select weapon...</option>
+                    <optgroup label="Weapons">
+                      {parsedData.weapons.filter(w => !w.isGlove).map(w => (
+                        <option key={w.className} value={w.className}>{w.displayName}</option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="Gloves">
+                      {parsedData.weapons.filter(w => w.isGlove).map(w => (
+                        <option key={w.className} value={w.className}>{w.displayName}</option>
+                      ))}
+                    </optgroup>
+                  </select>
+                  {selectedWeaponIsGlove && (
+                    <span style={{ fontSize: 10, color: "#e4ae39", marginTop: 2, display: "block" }}>
+                      Glove skin — will use 12000+ ID range
+                    </span>
+                  )}
+                </div>
+                <div>
+                  <label style={labelStyle}>Rarity</label>
+                  <select style={{ ...inputStyle, color: rarityColor, fontWeight: 600 }} value={form.rarity}
+                    onChange={e => setForm(p => ({ ...p, rarity: e.target.value }))}>
+                    {RARITIES.map(r => (
+                      <option key={r.id} value={r.id} style={{ color: r.color }}>{r.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{ position: "relative" }} ref={templateRef}>
+                  <label style={labelStyle}>Template (search by name or ID)</label>
+                  <input style={inputStyle}
+                    placeholder="Search name or ID..."
+                    value={templateSearch || form.template}
+                    onChange={e => { setTemplateSearch(e.target.value); setShowTemplateDropdown(true); setForm(p => ({ ...p, template: "" })); }}
+                    onFocus={() => setShowTemplateDropdown(true)}
+                    onBlur={() => setTimeout(() => setShowTemplateDropdown(false), 200)}
+                  />
+                  {showTemplateDropdown && filteredTemplates.length > 0 && (
+                    <div style={{
+                      position: "absolute", top: "100%", left: 0, right: 0, zIndex: 100,
+                      background: "#1e2a3a", border: "1px solid rgba(255,255,255,0.15)",
+                      borderRadius: 6, maxHeight: 220, overflowY: "auto",
+                      boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+                    }}>
+                      {filteredTemplates.map(t => (
+                        <div key={t.id} style={{
+                          padding: "7px 12px", cursor: "pointer", fontSize: 12,
+                          borderBottom: "1px solid rgba(255,255,255,0.04)", color: "#bbb",
+                          display: "flex", justifyContent: "space-between", alignItems: "center",
+                        }}
+                          onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.08)"}
+                          onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                          onMouseDown={() => {
+                            const kit = parsedData.paintKits[t.id] || {};
+                            setForm(p => ({
+                              ...p,
+                              template: t.name,
+                              wearMin: kit.wear_remap_min || p.wearMin,
+                              wearMax: kit.wear_remap_max || p.wearMax,
+                            }));
+                            setTemplateSearch("");
+                            setShowTemplateDropdown(false);
+                          }}>
+                          <span>
+                            {t.name}
+                            {t.hasNormal && <span style={{ color: "#e4ae39", marginLeft: 6, fontSize: 10 }}>N</span>}
+                          </span>
+                          <span style={{ color: "#555", fontSize: 11 }}>{t.id}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* Normal map warning */}
+                  {selectedTemplateInfo?.use_normal === "1" && (
+                    <div style={{
+                      marginTop: 6, padding: "6px 10px", borderRadius: 6, fontSize: 11,
+                      background: "rgba(228,174,57,0.1)", border: "1px solid rgba(228,174,57,0.25)",
+                      color: "#e4ae39",
+                    }}>
+                      ⚠ Template uses normal map. Will auto-generate: <strong>{derivedPattern}_normal</strong>
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <label style={labelStyle}>Pattern (auto-derived if empty)</label>
+                  <input style={inputStyle} placeholder={derivedPattern || "auto"}
+                    value={form.pattern} onChange={e => setForm(p => ({ ...p, pattern: e.target.value }))} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Wear Min</label>
+                  <input style={inputStyle} value={form.wearMin}
+                    onChange={e => setForm(p => ({ ...p, wearMin: e.target.value }))} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Wear Max</label>
+                  <input style={inputStyle} value={form.wearMax}
+                    onChange={e => setForm(p => ({ ...p, wearMax: e.target.value }))} />
+                </div>
+              </div>
+              <button onClick={addSkin} style={{
+                width: "100%", marginTop: 16, padding: "10px 0", borderRadius: 8,
+                background: "rgba(76,175,80,0.15)", border: "1px solid rgba(76,175,80,0.3)",
+                color: "#81c784", fontSize: 13, fontWeight: 600, cursor: "pointer",
+              }}>
+                + ADD TO QUEUE
+              </button>
+            </div>
+
+            {skins.length > 0 && (
+              <div style={{ ...cardStyle, marginTop: 20 }}>
+                <h2 style={{ ...headingStyle, marginBottom: 14 }}>
+                  Queue ({skins.length} skin{skins.length > 1 ? "s" : ""})
+                </h2>
+                {skins.map((s, i) => {
+                  const rc = RARITIES.find(r => r.id === s.rarity)?.color || "#888";
+                  return (
+                    <div key={i} style={{
+                      display: "flex", alignItems: "center", gap: 10, padding: "8px 12px",
+                      background: "rgba(255,255,255,0.03)", borderRadius: 6, marginBottom: 6,
+                      borderLeft: `3px solid ${rc}`,
+                    }}>
+                      <span style={{ flex: 1, fontSize: 13 }}>
+                        <strong style={{ color: rc }}>{s.displayName}</strong>
+                        <span style={{ color: "#555", margin: "0 6px" }}>·</span>
+                        <span style={{ color: "#999" }}>{s.name}</span>
+                        <span style={{ color: "#555", margin: "0 6px" }}>·</span>
+                        <span style={{ color: "#777" }}>{s.weapon.replace("weapon_", "").replace("studded_", "").replace("_gloves", "")}</span>
+                        {s.isGlove && <span style={{ color: "#e4ae39", marginLeft: 4, fontSize: 10 }}>[glove]</span>}
+                        {s.template && <>
+                          <span style={{ color: "#555", margin: "0 6px" }}>←</span>
+                          <span style={{ color: "#555" }}>{s.template}</span>
+                        </>}
+                      </span>
+                      <button onClick={() => removeSkin(i)} style={{
+                        background: "none", border: "none", color: "#d32ce6",
+                        cursor: "pointer", fontSize: 16, padding: "0 4px",
+                      }}>✕</button>
+                    </div>
+                  );
+                })}
+                <button onClick={processAndDownload} disabled={processing} style={{
+                  ...primaryBtnStyle, marginTop: 14,
+                  background: processing ? "rgba(255,255,255,0.06)" : "linear-gradient(135deg, #e4ae39, #eb4b4b)",
+                  color: processing ? "#666" : "#fff", cursor: processing ? "default" : "pointer",
+                }}>
+                  {processing ? "Processing..." : `PROCESS & DOWNLOAD ${skins.length} SKIN${skins.length > 1 ? "S" : ""}`}
+                </button>
+              </div>
+            )}
+
+            <button onClick={() => setStep(0)} style={backBtnStyle}>← Back to file upload</button>
+          </>
+        )}
+
+        {step === 2 && (
+          <div style={cardStyle}>
+            <h2 style={{ fontSize: 16, fontWeight: 600, margin: "0 0 14px", color: "#81c784" }}>
+              ✓ Processing Complete
+            </h2>
+            <pre style={{
+              background: "rgba(0,0,0,0.3)", borderRadius: 8, padding: 16,
+              fontSize: 12, color: "#aaa", lineHeight: 1.6, overflowX: "auto",
+              maxHeight: 400, overflowY: "auto", whiteSpace: "pre-wrap",
+            }}>
+              {log.join("\n")}
+            </pre>
+            <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+              <button onClick={() => { setStep(1); setSkins([]); setLog([]); }} style={{
+                flex: 1, padding: "10px 0", borderRadius: 8,
+                background: "rgba(228,174,57,0.15)", border: "1px solid rgba(228,174,57,0.3)",
+                color: "#e4ae39", fontSize: 13, fontWeight: 600, cursor: "pointer",
+              }}>
+                Add More Skins
+              </button>
+              <button onClick={() => {
+                setStep(0);
+                setFiles({ itemsGame: null, csgoEnglish: null, itemsEn: null });
+                setFileContents({ itemsGame: "", csgoEnglish: null, itemsEn: null });
+                setSkins([]); setLog([]);
+              }} style={{
+                flex: 1, padding: "10px 0", borderRadius: 8,
+                background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)",
+                color: "#888", fontSize: 13, fontWeight: 600, cursor: "pointer",
+              }}>
+                Start Over
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const cardStyle = {
+  background: "rgba(255,255,255,0.04)", borderRadius: 12,
+  border: "1px solid rgba(255,255,255,0.08)", padding: 24,
+};
+const headingStyle = { fontSize: 16, fontWeight: 600, margin: "0 0 20px", color: "#ccc" };
+const labelStyle = { display: "block", fontSize: 11, color: "#888", marginBottom: 4, fontWeight: 500, letterSpacing: 0.5 };
+const inputStyle = {
+  width: "100%", padding: "8px 10px", borderRadius: 6, fontSize: 13,
+  background: "rgba(0,0,0,0.25)", border: "1px solid rgba(255,255,255,0.1)",
+  color: "#ddd", outline: "none", boxSizing: "border-box",
+};
+const primaryBtnStyle = {
+  width: "100%", padding: "12px 0", borderRadius: 8, border: "none",
+  fontSize: 14, fontWeight: 600, letterSpacing: 1,
+};
+const fileBtnStyle = {
+  padding: "5px 14px", borderRadius: 6, fontSize: 12, cursor: "pointer",
+  background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.12)",
+  color: "#ccc",
+};
+const backBtnStyle = {
+  marginTop: 16, background: "none", border: "1px solid rgba(255,255,255,0.1)",
+  color: "#666", padding: "8px 16px", borderRadius: 6, cursor: "pointer", fontSize: 12,
+};
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
